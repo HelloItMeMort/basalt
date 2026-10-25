@@ -247,7 +247,8 @@ class ProcessEngine:
             loading.set()                               # the narrator stops and the log handle goes back
             if log:
                 self.log.close()
-            raise EngineStartError(f"the engine could not be started: {e}", log) from e
+            # the program's own name: an OSError's text does not always carry it
+            raise EngineStartError(f"the engine could not be started: {engine_bin}: {e.strerror or e}", log) from e
         frame_pipes(self.proc, sink is not None)
         if sink:
             threading.Thread(target=pump_lines, args=(self.proc.stderr, sink), daemon=True).start()

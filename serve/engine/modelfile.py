@@ -12,7 +12,8 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools"))
 from model_file import ModelFile  # noqa: E402
 
-VISION_EXE = "basalt-vision"
+# Built programs carry the platform's executable suffix; the CMake target's name is the bare one.
+VISION_EXE = "basalt-vision" + (".exe" if os.name == "nt" else "")
 
 
 def cache_root() -> Path:

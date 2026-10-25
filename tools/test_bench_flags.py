@@ -11,8 +11,9 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-ENGINE = Path(os.environ.get("BASALT_BIN", ROOT / "bin" / "basalt"))
-BENCH = Path(os.environ.get("BASALT_BENCH_BIN", ROOT / "bin" / "basalt-bench"))
+EXE = ".exe" if os.name == "nt" else ""          # what the build names its programs on Windows
+ENGINE = Path(os.environ.get("BASALT_BIN", ROOT / "bin" / ("basalt" + EXE)))
+BENCH = Path(os.environ.get("BASALT_BENCH_BIN", ROOT / "bin" / ("basalt-bench" + EXE)))
 # bench's own options that share an engine flag's name
 BENCH_OWNED = {"--help", "--model", "--engine", "--spec", "--set", "--seed", "--gpu"}
 

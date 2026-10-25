@@ -103,8 +103,9 @@ void iq4nl_dequant_row(const uint8_t* row, float* out160) {
 }
 
 void nvfp4_dequant_row(const uint8_t* row, float* out160, float scale_2) {
-    // `dequantize_nvfp4`'s inner loop (basalt/artifact/dequant.hpp) per 16-value group: the table's rows hold the
-    // codes in an expert block's arrangement, so one value means one decode and the two paths cannot drift.
+    // `dequantize_nvfp4`'s inner loop (basalt/artifact/dequant.hpp) per 16-value group, so one value means one
+    // decode and the two paths cannot drift.  A row is 10 scale-then-8-codes groups, not ggml's block with its
+    // four scales hoisted to the front: the group is what the two share, which `ple_nvfp4_test` pins.
     for (int g = 0; g < PLE_HEAD_DIM / 16; ++g) {
         const float sc = basalt::ue4m3_to_fp32_half(row[g * 9]) * scale_2;
         const uint8_t* q = row + g * 9 + 1;

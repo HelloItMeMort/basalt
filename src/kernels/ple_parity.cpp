@@ -343,11 +343,12 @@ int main(int argc, char** argv) {
         const std::string a = argv[i];
         if (a == "--selftest") selftest = true;
         else if (a == "--check-fixtures") check_fixtures = true;
+        else if (a == "--nvfp4") return nvfp4_row_parity() ? 1 : 0;
         else if (a == "--dense" && i + 1 < argc) dense = argv[++i];
         else if (a == "--gguf" && i + 1 < argc) gguf = argv[++i];
         else if (a == "--in" && i + 1 < argc) in_bin = argv[++i];
         else if (a == "--out" && i + 1 < argc) out_bin = argv[++i];
-        else { std::fprintf(stderr, "usage: ple_parity [--selftest] [--check-fixtures] [--dense F] [--gguf F] [--in F] [--out F]\n");
+        else { std::fprintf(stderr, "usage: ple_parity [--selftest] [--check-fixtures] [--nvfp4] [--dense F] [--gguf F] [--in F] [--out F]\n");
                return 2; }
     }
     if (selftest && check_fixtures) {
@@ -355,7 +356,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     // The row decode needs no fixture and no device, so it runs in every mode: a wrong NVFP4 decode is a wrong
-    // model however the rest of this test was invoked.
+    // model however the rest of this test was invoked.  `--nvfp4`, above, is the mode CI registers for it.
     if (nvfp4_row_parity()) return 1;
     // Required self-test fixtures are checked before the first CUDA call, so
     // missing files cannot become an apparent pass or a misleading GPU error.

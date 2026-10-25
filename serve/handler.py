@@ -733,9 +733,51 @@ class Server(ThreadingHTTPServer):
             super().handle_error(request, client_address)
 
 
-def serve(svc: Service, host="127.0.0.1", port=8080) -> ThreadingHTTPServer:
-    svc.host_names = host_names_for(host, svc.allowed_hosts, svc.trusted_origins)
+class MultiServer:
+    """The HTTP servers behind the addresses one `serve` call bound: they share the service, and the caller
+    stops and closes them as one."""
+
+    def __init__(self, httpds):
+        self.httpds = list(httpds)
+
+    @property
+    def hosts(self):
+        return [h.server_address[0] for h in self.httpds]
+
+    @property
+    def server_address(self):
+        return self.httpds[0].server_address
+
+    def shutdown(self):
+        for h in self.httpds:
+            h.shutdown()
+
+    def server_close(self):
+        for h in self.httpds:
+            h.server_close()
+
+
+def serve(svc: Service, host="127.0.0.1", port=8080) -> MultiServer:
+    """One HTTP server per address in `host` (an address, or a list of them), all sharing `svc`. An address that
+    will not bind is an error naming it with nothing left listening: answering on half the addresses you asked
+    for is worse than not starting."""
+    hosts = [host] if isinstance(host, str) else [str(h) for h in host]
+    if not hosts:
+        hosts = ["127.0.0.1"]
+    names = set()
+    for h in hosts:
+        names |= host_names_for(h, svc.allowed_hosts, svc.trusted_origins)
+    svc.host_names = names
     svc.start_telemetry()
-    httpd = Server((host, port), make_handler(svc))
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    return httpd
+    handler = make_handler(svc)
+    httpds = []
+    for h in hosts:
+        try:
+            httpds.append(Server((h, port), handler))
+        except OSError as e:
+            for b in httpds:
+                b.server_close()
+            raise OSError(f"cannot listen on {h}:{port}: {e.strerror or e}") from None
+    for b in httpds:
+        threading.Thread(target=b.serve_forever, daemon=True).start()
+    return MultiServer(httpds)

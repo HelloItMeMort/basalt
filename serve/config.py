@@ -157,6 +157,8 @@ def parse_settings(ap: argparse.ArgumentParser, cli: list[str]):
     for act in ap._actions:                                # a repeatable command-line option replaces the file's
         if isinstance(act, argparse._AppendAction) and getattr(a_cli, act.dest) != act.default:
             setattr(a, act.dest, getattr(a_cli, act.dest))
+    if not a.host:
+        a.host = ["127.0.0.1"]             # argparse's default is the empty list: unset means this PC only
     if a.parallel and a.parallel > 1:
         for flag in ("--batch", "--slots"):
             if flag in file_words or flag in cli_words:
@@ -362,9 +364,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="image input: off (default), dynamic (inside the engine: it borrows expert-cache slots "
                          "on the main GPU while it reads an image, no standing VRAM), cpu (no VRAM, slow) or a "
                          "GPU number, as nvidia-smi numbers them: the encoder sidecar, always on that card")
-    ap.add_argument("--host", default="127.0.0.1",
-                    help="the address to listen on: 127.0.0.1 = this PC only (the default), 0.0.0.0 = also other "
-                         "devices on your network (give --api-key)")
+    ap.add_argument("--host", action="append", default=[], metavar="ADDRESS",
+                    help="the address to listen on, given once per address (default: 127.0.0.1 = this PC only), "
+                         "e.g. --host 127.0.0.1 --host 192.168.1.20; 0.0.0.0 = every interface (give --api-key)")
     ap.add_argument("--script", action="append",
                     help="the mock engine's answer (default: a short greeting); given more than once, requests get "
                          "them in turn and the last one repeats")

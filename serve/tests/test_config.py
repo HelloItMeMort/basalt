@@ -387,9 +387,9 @@ class EveryOption(unittest.TestCase):
             check_engine_flags(file_words, known, "config")
 
     def test_the_built_engine_accepts_every_flag(self):
-        engine_bin = ROOT / "bin/basalt"
+        engine_bin = ROOT / "bin" / ("basalt" + (".exe" if os.name == "nt" else ""))
         if not engine_bin.exists():
-            self.skipTest("no built bin/basalt")
+            self.skipTest(f"no built {engine_bin}")
         missing = set(engine_parser_flags()) - (engine_flags_of(str(engine_bin)) or set())
         self.assertEqual(missing, set())
 

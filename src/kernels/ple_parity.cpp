@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -330,6 +331,34 @@ int nvfp4_row_parity() {
     return bad;
 }
 
+/// The row decode's own throughput: 262,144 rows of random bytes already in memory, so this is the decode and
+/// not the read (the reader's `io_report` says what it actually pulled).  Run it with `--bench`.
+int nvfp4_row_bench() {
+    std::printf("D. the NVFP4 PLE row decode, throughput\n");
+    const int rows = 1 << 18;
+    std::mt19937 rng(20);
+    std::vector<uint8_t> table((size_t) rows * k::PLE_ROW_BYTES_NVFP4);
+    for (size_t i = 0; i < table.size(); ++i)
+        table[i] = (uint8_t) (i % 9 == 0 ? (rng() & 0x7E) : rng());   // a scale byte stays clear of NaN
+    std::vector<float> out(k::PLE_HEAD_DIM, 0.0f);
+    double best = 0.0;
+    for (int pass = 0; pass < 3; ++pass) {
+        const auto t0 = std::chrono::steady_clock::now();
+        double sum = 0.0;
+        for (int r = 0; r < rows; ++r) {
+            k::nvfp4_dequant_row(table.data() + (size_t) r * k::PLE_ROW_BYTES_NVFP4, out.data(), 3.324236240587197e-05f);
+            sum += std::fabs(out[r % k::PLE_HEAD_DIM]);           // keeps the decode from being optimised away
+        }
+        const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (!(sum > 0.0)) { std::printf("  the decode produced nothing finite\n"); return 1; }
+        best = best == 0.0 ? dt : std::min(best, dt);
+    }
+    std::printf("  %-46s %.0f M values/s (%.0f MB/s of rows, %d rows)\n", "nvfp4_dequant_row",
+                (double) rows * k::PLE_HEAD_DIM / best / 1e6,
+                (double) rows * k::PLE_ROW_BYTES_NVFP4 / best / 1e6, rows);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -344,11 +373,12 @@ int main(int argc, char** argv) {
         if (a == "--selftest") selftest = true;
         else if (a == "--check-fixtures") check_fixtures = true;
         else if (a == "--nvfp4") return nvfp4_row_parity() ? 1 : 0;
+        else if (a == "--bench") return nvfp4_row_bench();
         else if (a == "--dense" && i + 1 < argc) dense = argv[++i];
         else if (a == "--gguf" && i + 1 < argc) gguf = argv[++i];
         else if (a == "--in" && i + 1 < argc) in_bin = argv[++i];
         else if (a == "--out" && i + 1 < argc) out_bin = argv[++i];
-        else { std::fprintf(stderr, "usage: ple_parity [--selftest] [--check-fixtures] [--nvfp4] [--dense F] [--gguf F] [--in F] [--out F]\n");
+        else { std::fprintf(stderr, "usage: ple_parity [--selftest] [--check-fixtures] [--nvfp4] [--bench] [--dense F] [--gguf F] [--in F] [--out F]\n");
                return 2; }
     }
     if (selftest && check_fixtures) {

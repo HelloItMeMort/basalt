@@ -17,13 +17,14 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import struct
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-ENGINE_BIN = Path(__file__).resolve().parents[1] / "bin" / "basalt"
+ENGINE_BIN = Path(__file__).resolve().parents[1] / "bin" / ("basalt" + (".exe" if os.name == "nt" else ""))
 
 
 def read_base(path: str):

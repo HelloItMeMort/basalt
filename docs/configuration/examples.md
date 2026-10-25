@@ -66,5 +66,25 @@ A smaller KV format and a shorter context leave more VRAM for experts; the rest 
 }
 ```
 
+## Reachable from this machine and one address on the network
+
+`host` is repeatable: the server listens on exactly the addresses you list, and nowhere else. An `api-key`
+cannot go in the file, so pass it on the command line: `bin/basalt serve --config basalt_config.json
+--api-key KEY`.
+
+```json
+{
+  "server": {
+    "model": "model.basalt",
+    "host": ["127.0.0.1", "192.168.1.20"],
+    "port": 8080
+  },
+  "engine": {
+    "max-context": 65536,
+    "kv": "int8"
+  }
+}
+```
+
 Optional on any of them: `"relaxed-drafting": 0.5` in `engine` trades exactness under sampling for speed (see
 [Speculative decoding](index.md#speculative-decoding-mtp)).

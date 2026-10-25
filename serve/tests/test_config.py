@@ -143,6 +143,14 @@ class Precedence(unittest.TestCase):
         a, *_ = parse(["--cors-origin", "http://b"], {"server": {"cors-origin": ["http://a"]}})
         self.assertEqual(a.cors_origin, ["http://b"])
 
+    def test_the_addresses_to_listen_on(self):
+        self.assertEqual(parse([])[0].host, ["127.0.0.1"])              # unset is this PC only
+        two = ["--host", "127.0.0.1", "--host", "198.51.100.7"]
+        self.assertEqual(parse(two)[0].host, ["127.0.0.1", "198.51.100.7"])
+        cfg = {"server": {"host": ["127.0.0.1", "198.51.100.7"]}}
+        self.assertEqual(parse([], cfg)[0].host, ["127.0.0.1", "198.51.100.7"])
+        self.assertEqual(parse(["--host", "198.51.100.9"], cfg)[0].host, ["198.51.100.9"])
+
     def test_switch_true_and_false(self):
         self.assertTrue(parse([], {"server": {"lazy": True}})[0].lazy)
         self.assertFalse(parse([], {"server": {"lazy": False}})[0].lazy)
@@ -336,7 +344,7 @@ class EveryOption(unittest.TestCase):
         for name, act in server_options(ap).items():
             if name in ("api-key", "engine-bin", "grammar"):   # grammar is on by default: no-grammar differs, see test_grammar
                 continue
-            v = "localhost" if name == "host" else self.sample(act)
+            v = self.sample(act)
             if isinstance(act, argparse._AppendAction):
                 cli, cfgv = ["--" + name, "x"], ["x"]
             elif v is True:
@@ -392,10 +400,10 @@ class ApiKey(unittest.TestCase):
 
     def test_a_network_host_from_the_config_starts_without_a_key(self):
         cfg = {"server": {"host": "0.0.0.0"}}
-        self.assertEqual(parse([], cfg)[0].host, "0.0.0.0")
+        self.assertEqual(parse([], cfg)[0].host, ["0.0.0.0"])
         a = parse(["--api-key", "k"], cfg)[0]
-        self.assertEqual((a.host, a.api_key), ("0.0.0.0", "k"))
-        self.assertEqual(parse([], {"server": {"host": "127.0.0.1"}})[0].host, "127.0.0.1")
+        self.assertEqual((a.host, a.api_key), (["0.0.0.0"], "k"))
+        self.assertEqual(parse([], {"server": {"host": "127.0.0.1"}})[0].host, ["127.0.0.1"])
 
     def test_exposed_without_key(self):
         self.assertTrue(exposed_without_key("0.0.0.0", ""))

@@ -48,7 +48,7 @@ A config file is one JSON object with two optional blocks:
 ```
 
 - Keys are the flag names without the dashes (`_` works for `-`). Values are strings or numbers; a switch is `true`, and
-  `false` leaves it off. A repeatable option (`allowed-host`, `cors-origin`) takes a list.
+  `false` leaves it off. A repeatable option (`host`, `allowed-host`, `cors-origin`) takes a list.
 - `model` and `tokenizer` paths are relative to the config file.
 - **Precedence:** command line > config file > built-in defaults. The engine receives the config file's flags, then
   the command line's, and a flag given twice takes its last value.
@@ -89,7 +89,7 @@ Server options. Command line `--name`, config `server` block `"name"`.
 | --- | --- | --- | --- |
 | `model` | path | none (required) | The `.basalt` model file. The weights, tokenizer, chat template, drafter, vision projector and default sampling all come from it. |
 | `alias` | string | the name stored in the model file | The model name the API reports. Change it when a client expects a particular name. |
-| `host` | address | `127.0.0.1` | The address to listen on. `127.0.0.1` is this machine only; `0.0.0.0` also serves the network. Never listen beyond `127.0.0.1` without `api-key`. |
+| `host` | address, repeatable | `127.0.0.1` | The address to listen on, given once per address: `["127.0.0.1", "192.168.1.20"]` listens on exactly those two and nothing else. `127.0.0.1` is this machine only; `0.0.0.0` every interface. Never listen beyond `127.0.0.1` without `api-key`. |
 | `port` | integer | `8080` | The TCP port. |
 | `api-key` | string | none | Require this key on `/v1/*` (`Authorization: Bearer ...` or `x-api-key`). Command line only. Set it whenever `host` is not `127.0.0.1`. |
 | `allowed-host` | string, repeatable | none | Also answer to this `Host` name; `"*"` turns the check off. Needed when clients reach the server by a name other than its address. |

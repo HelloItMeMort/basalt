@@ -1,6 +1,6 @@
 """OpenAI, Anthropic and Responses endpoints over an engine that maps token ids to tokens.
 
-    basalt serve --model FILE.basalt [--alias NAME] [--host H] [--port P] [--gpu 0,1] [--api-key KEY] ...
+    basalt serve --model FILE.basalt [--alias NAME] [--host ADDRESS]... [--port P] [--gpu 0,1] [--api-key KEY] ...
     python -m serve.server --model FILE.basalt --engine-bin bin/basalt ...
     python -m serve.server --config config.json
     python -m serve.server --mock-engine --port 8080
@@ -33,7 +33,7 @@ from serve.engine.vision import (EngineVision, Vision, check_gpu, child_env, eng
                                  gpu_text, gpus_in_play, peer_card, vision_env, vision_line)
 from serve.frontend import ChatTemplate  # noqa: E402
 from serve.handler import Server, serve  # noqa: E402
-from serve.security import (LOOPBACK_NAMES, allowed_hosts_of, api_key_of, exposed_without_key,  # noqa: E402
+from serve.security import (LOOPBACK_NAMES, allowed_hosts_of, api_key_of,  # noqa: E402
                             lan_addresses, origins_of)
 from serve.service import Service  # noqa: E402
 from serve.util.logbuf import ColorStream, LogBuffer, TeeStream, tail_file  # noqa: E402
@@ -124,10 +124,11 @@ def main() -> int:
                                     grammar_entry(a.grammar, sys.argv[1:], used_argv)), flush=True)
     if a.alias:
         cfg["model_name"] = a.alias
-    try:                                                # fail fast if the port is taken
-        Server((a.host, a.port), BaseHTTPRequestHandler).server_close()
-    except OSError:
-        fail(f"port {a.port} is in use (--port N)")
+    for host in a.host:                                       # fail fast if an address or the port is taken
+        try:
+            Server((host, a.port), BaseHTTPRequestHandler).server_close()
+        except OSError:
+            fail(f"cannot listen on {host}:{a.port} (--port N, or --host ADDRESS for another address)")
     if cfg.get("tokenizer"):
         a.tokenizer = cfg["tokenizer"]
     tok = ByteTokenizer()
@@ -226,7 +227,8 @@ def main() -> int:
     svc.gpu_index = svc.gpu_indices[0]
     httpd = serve(svc, host=a.host, port=a.port)
     svc.start_idle_unload()
-    here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
+    here = next((h for h in a.host if h in LOOPBACK_NAMES),   # the printed address is one you can open here
+                 "127.0.0.1" if any(h in ("0.0.0.0", "::") for h in a.host) else a.host[0])
     print(f"[server] ready: http://{here}:{a.port}/v1 (OpenAI /v1/chat/completions, Anthropic /v1/messages), "
           f"context {engine.max_context} tokens{', images on' if vision else ''}"
           f"{', API key required' if svc.api_key else ''}", flush=True)
@@ -235,18 +237,19 @@ def main() -> int:
               f"{engine.max_context} tokens" + (f" ({engine.batch} x {engine.max_context} of KV cache: --slot-full-context)"
                                                 if a.slot_full_context else ""), flush=True)
     print(f"[server] stats: http://{here}:{a.port}/ (Ctrl+C stops)", flush=True)
-    if a.host not in LOOPBACK_NAMES:
-        # reachable from other devices: print the addresses
-        ips = lan_addresses()
-        for ip in ips:
+    remote = [h for h in a.host if h not in LOOPBACK_NAMES]
+    if remote:
+        # reachable from other devices: print the addresses they arrive at (every one, when bound to all)
+        ips = [h for h in remote if h not in ("0.0.0.0", "::")] or lan_addresses()
+        for ip in dict.fromkeys(ips):
             print(f"[server] network: http://{ip}:{a.port}/v1", flush=True)
         if not ips:
             print(f"[server] network: port {a.port}", flush=True)
-        if exposed_without_key(a.host, svc.api_key):
+        if not svc.api_key:
             print("[server] warning: no API key, open to the network (--api-key KEY)", flush=True)
     if a.open:
         import webbrowser
-        webbrowser.open(f"http://{'127.0.0.1' if a.host in ('0.0.0.0', '') else a.host}:{a.port}/")
+        webbrowser.open(f"http://{here}:{a.port}/")
     # SIGTERM takes Ctrl+C's path (QUIT to the engine) so a container stop does not orphan it
     def on_sigterm(signum, frame):
         raise KeyboardInterrupt

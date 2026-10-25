@@ -710,8 +710,9 @@ class PleNvfp4:
     """The PLE n-gram table of a checkpoint that stores it as NVFP4 shards (`...ngram_embedding.shard_K.weight`:
     uint8 [rows, PLE_DIM / 2] E2M1 codes, value 2i in the low nibble of byte i) with `...shard_K.weight_scale`
     UE4M3 per 16 values and one F32 `...weight_scale_2` for the whole table. A row is 90 bytes: per 16 values one
-    scale byte then 8 code bytes holding value j in the low nibble of byte j and value j + 8 in its high nibble,
-    which is how Basalt stores an NVFP4 block."""
+    scale byte then 8 code bytes holding value j in the low nibble of byte j and value j + 8 in its high nibble -
+    the pairing an NVFP4 block's codes use, but with each scale kept with its own group instead of a block's
+    hoisted four, so 160 values are 2.5 blocks and a row is not a whole number of them."""
 
     ROW_BYTES = (PLE_DIM // 16) * 9
 

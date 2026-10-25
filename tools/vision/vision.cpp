@@ -141,10 +141,15 @@ int main(int argc, char** argv) {
         std::string img_path, out_path;
         if (!parse_enc(line, img_path, out_path)) { std::printf("ERR expected: ENC <image> <output>\n"); std::fflush(stdout); continue; }
         const auto t0 = std::chrono::steady_clock::now();
-        std::ifstream f(img_path, std::ios::binary);
-        const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        std::vector<uint8_t> bytes;
+        bool readable = false;
+        {   // the caller deletes the image once it has the answer: hand it back before the reply is printed
+            std::ifstream f(img_path, std::ios::binary);
+            bytes.assign((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            readable = static_cast<bool>(f);
+        }
         Image img;
-        if (!f || bytes.empty() || !decode_image(bytes.data(), bytes.size(), img, err)) {
+        if (!readable || bytes.empty() || !decode_image(bytes.data(), bytes.size(), img, err)) {
             std::printf("ERR cannot read the image %s\n", img_path.c_str());
             std::fflush(stdout);
             continue;

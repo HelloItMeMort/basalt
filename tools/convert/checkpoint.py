@@ -219,6 +219,8 @@ class CheckpointExperts:
                         ck.need(fixed, "U8", (rows // 16, 16 * (1 + cols // 32)))
                         exc = p + "weight_scale.nvfp4_csf_exceptions"
                         ck.need(exc, "U32")
+                        if len(ck.t[exc][3]) != 1:    # the word count is the shape's first entry
+                            raise S.ConvertError(f"{exc} is {ck.t[exc][2]} {ck.t[exc][3]}, expected a 1-D array of words")
                         sn, xn = fixed, exc
                         self.csf += 1
                     else:

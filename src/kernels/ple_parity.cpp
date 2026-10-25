@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <random>
 #include <string>
 #include <stdexcept>
 #include <vector>
@@ -235,6 +236,100 @@ int history_advance_regression() {
     return bad;
 }
 
+/// The NVFP4 PLE row decode against an independent double-precision transcription of the format, on random rows at
+/// the real geometry: 160 values as 10 groups of one UE4M3 scale byte and 8 code bytes.  Written from the format
+/// rather than from `dequantize_nvfp4`, so that the two agreeing means something.
+int nvfp4_row_parity() {
+    std::printf("D. the NVFP4 PLE row decode, against a double-precision reference\n");
+    const double kE2M1[16] = {0, .5, 1, 1.5, 2, 3, 4, 6, -0, -.5, -1, -1.5, -2, -3, -4, -6};
+    auto ue4m3 = [](uint8_t b) {
+        b &= 0x7F;                                   // bit 7 is ignored, and 0x7F is NaN: both decode as 0
+        if (b == 0 || b == 0x7F) return 0.0;
+        const int e = (b >> 3) & 0xF, m = b & 7;
+        return e == 0 ? (double) m * std::ldexp(1.0, -9)
+                      : (1.0 + (double) m / 8.0) * std::ldexp(1.0, e - 7);
+    };
+    auto ref_row = [&](const uint8_t* row, double scale_2, bool checkpoint_order, double* out) {
+        for (int g = 0; g < k::PLE_HEAD_DIM / 16; ++g) {
+            const double sc = ue4m3(row[g * 9]) * scale_2;
+            const uint8_t* q = row + g * 9 + 1;
+            for (int j = 0; j < 8; ++j) {
+                const int lo = q[j] & 0x0F, hi = q[j] >> 4;
+                if (checkpoint_order) {         // the checkpoint pairs value 2i with 2i+1 in byte i
+                    out[g * 16 + 2 * j] = kE2M1[lo] * sc;
+                    out[g * 16 + 2 * j + 1] = kE2M1[hi] * sc;
+                } else {                        // Basalt's blocks pair value j with j+8
+                    out[g * 16 + j] = kE2M1[lo] * sc;
+                    out[g * 16 + j + 8] = kE2M1[hi] * sc;
+                }
+            }
+        }
+    };
+    // A real table scale, and a tiny one: a decode that dropped it, or an off-by-a-power-of-two scale, is then
+    // visible against the reference rather than merely plausible.
+    const float scale_2 = 3.324236240587197e-05f;
+    std::mt19937 rng(20261024u);
+    int bad = 0;
+    double worst = 0;
+    long long nf = 0;
+    double rival_sep = 1e30;
+    for (int r = 0; r < 64; ++r) {
+        std::vector<uint8_t> row(k::PLE_ROW_BYTES_NVFP4);
+        for (auto& b : row) b = (uint8_t) rng();
+        for (int g = 0; g < k::PLE_HEAD_DIM / 16; ++g) row[g * 9] = (uint8_t) (1 + rng() % 0x7E);   // a plain scale
+        std::vector<float> got(k::PLE_HEAD_DIM);
+        k::nvfp4_dequant_row(row.data(), got.data(), scale_2);
+        nf += nonfinite(got.data(), k::PLE_HEAD_DIM);
+        std::vector<double> want(k::PLE_HEAD_DIM), rival(k::PLE_HEAD_DIM);
+        ref_row(row.data(), (double) scale_2, false, want.data());
+        ref_row(row.data(), (double) scale_2, true, rival.data());
+        double rowmax = 0;
+        for (double w : want) if (!(w <= rowmax)) rowmax = std::fabs(w);      // NaN-safe, as everywhere here
+        std::vector<float> rwant(k::PLE_HEAD_DIM), rrival(k::PLE_HEAD_DIM);
+        for (int i = 0; i < k::PLE_HEAD_DIM; ++i) {
+            const double rel = std::fabs((double) got[i] - want[i]) / (rowmax > 0 ? rowmax : 1.0);
+            if (!le(rel, 1e-6)) {
+                std::printf("      row %d value %d: got %.9g want %.9g\n", r, i, (double) got[i], want[i]);
+                ++bad;
+                break;
+            }
+            if (gt(rel, worst)) worst = rel;
+            rwant[i] = got[i];
+            rrival[i] = (float) rival[i];
+        }
+        const double sep = rel_l1(rwant.data(), rrival.data(), k::PLE_HEAD_DIM);
+        if (gt(sep, 0.0) && sep < rival_sep) rival_sep = sep;
+    }
+    const bool exact = bad == 0 && le(worst, 1e-6) && nf == 0;
+    std::printf("  %-46s %s (worst relative %.3e, non-finite %lld)\n", "random rows match the double reference",
+                exact ? "yes" : "*** NO ***", worst, nf);
+    if (!exact) ++bad;
+    const bool sep_ok = gt(rival_sep, 0.05);
+    std::printf("  %-46s %s (at least %.2f%% apart)\n", "Basalt vs checkpoint nibble order observable",
+                sep_ok ? "yes" : "*** NO ***", rival_sep * 100);
+    if (!sep_ok) ++bad;
+    // A NaN scale zeroes its 16 values and a scale's sign bit is ignored, as in `dequantize_nvfp4`; the code bytes
+    // stay non-zero so that a decoder which simply produced zeros would not pass.
+    std::vector<uint8_t> row(k::PLE_ROW_BYTES_NVFP4, 0);
+    for (int g = 0; g < k::PLE_HEAD_DIM / 16; ++g) { row[g * 9] = 0x7F; row[g * 9 + 1] = 0x5A; }
+    std::vector<float> got(k::PLE_HEAD_DIM, 1.0f);
+    k::nvfp4_dequant_row(row.data(), got.data(), scale_2);
+    bool zeroed = true;
+    for (float v : got) if (v != 0.0f) zeroed = false;
+    std::printf("  %-46s %s\n", "a NaN scale byte zeroes its 16 values", zeroed ? "yes" : "*** NO ***");
+    if (!zeroed) ++bad;
+    std::vector<uint8_t> hi = row, lo = row;
+    for (int g = 0; g < k::PLE_HEAD_DIM / 16; ++g) { hi[g * 9] = 0xC1; lo[g * 9] = 0x41; }
+    std::vector<float> a(k::PLE_HEAD_DIM), b(k::PLE_HEAD_DIM);
+    k::nvfp4_dequant_row(hi.data(), a.data(), scale_2);
+    k::nvfp4_dequant_row(lo.data(), b.data(), scale_2);
+    bool same = true;
+    for (int i = 0; i < k::PLE_HEAD_DIM; ++i) if (a[i] != b[i]) same = false;
+    std::printf("  %-46s %s\n", "a scale byte's sign bit is ignored", same ? "yes" : "*** NO ***");
+    if (!same) ++bad;
+    return bad;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -259,6 +354,9 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "ple_parity: --check-fixtures is CPU-only; use it separately from --selftest\n");
         return 2;
     }
+    // The row decode needs no fixture and no device, so it runs in every mode: a wrong NVFP4 decode is a wrong
+    // model however the rest of this test was invoked.
+    if (nvfp4_row_parity()) return 1;
     // Required self-test fixtures are checked before the first CUDA call, so
     // missing files cannot become an apparent pass or a misleading GPU error.
     k::PleTable table;

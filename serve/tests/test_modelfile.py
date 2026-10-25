@@ -92,7 +92,7 @@ class Peer(Tmp):
 
     def test_vision_tells_the_engine(self):
         path = self.build(vision=True)
-        (self.engine_bin.parent / "basalt-vision").write_text("")
+        (self.engine_bin.parent / modelfile.VISION_EXE).write_text("")
         cfg = modelfile.model_config(path, str(self.engine_bin), vision=True)
         self.assertIn("vision", cfg)
         self.assertIn("--vision", cfg["args"])
@@ -120,7 +120,7 @@ class Peer(Tmp):
 class Vision(Tmp):
     def test_sidecar_beside_the_engine_bin_and_sections_unpacked(self):
         path = self.build(vision=True)
-        side = self.engine_bin.parent / "basalt-vision"
+        side = self.engine_bin.parent / modelfile.VISION_EXE
         side.write_text("")
         v = modelfile.model_config(path, str(self.engine_bin), vision=True)["vision"]
         self.assertEqual(v["vision_bin"], str(side.resolve()))
@@ -130,20 +130,20 @@ class Vision(Tmp):
 
     def test_off_by_default(self):
         path = self.build(vision=True)
-        (self.engine_bin.parent / "basalt-vision").write_text("")
+        (self.engine_bin.parent / modelfile.VISION_EXE).write_text("")
         cfg = modelfile.model_config(path, str(self.engine_bin))
         self.assertNotIn("vision", cfg)
         self.assertNotIn("--vision", cfg["args"])
 
     def test_gpu_or_cpu_encoder(self):
         path = self.build(vision=True)
-        (self.engine_bin.parent / "basalt-vision").write_text("")
+        (self.engine_bin.parent / modelfile.VISION_EXE).write_text("")
         self.assertTrue(modelfile.model_config(path, str(self.engine_bin), vision=True)["vision"]["gpu"])
         self.assertFalse(modelfile.model_config(path, str(self.engine_bin), vision="cpu")["vision"]["gpu"])
 
     def test_modes_name_the_encoder(self):
         path = self.build(vision=True)
-        (self.engine_bin.parent / "basalt-vision").write_text("")
+        (self.engine_bin.parent / modelfile.VISION_EXE).write_text("")
         for mode, name in (("on", "on"), (True, "on"), ("peer", "peer"), ("cpu", "cpu"), ("dynamic", "dynamic")):
             self.assertEqual(modelfile.model_config(path, str(self.engine_bin), vision=mode)["vision"]["mode"], name)
 
@@ -164,7 +164,7 @@ class Vision(Tmp):
 
     def test_error_when_the_model_has_no_projector(self):
         path = self.build(vision=False)
-        (self.engine_bin.parent / "basalt-vision").write_text("")
+        (self.engine_bin.parent / modelfile.VISION_EXE).write_text("")
         with self.assertRaisesRegex(ValueError, "projector"):
             modelfile.model_config(path, str(self.engine_bin), vision="cpu")
 

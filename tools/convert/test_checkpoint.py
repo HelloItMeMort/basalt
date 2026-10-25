@@ -209,6 +209,52 @@ class Nvfp4RepackTest(unittest.TestCase):
                 self.assertEqual(C._expert_job(([entries], 1)), want)
 
 
+CSF_DIR = Path(__file__).resolve().parents[2] / "tests" / "data" / "csf"
+
+
+def csf_fixture(path: Path):
+    """A frozen CSF case: rows, cols, the fixed slabs, the exception words, and the scale bytes a second
+    implementation of the codec says those streams mean."""
+    rows = cols = 0
+    parts = {"fixed": [], "exceptions": [], "expected": []}
+    for line in path.read_text(encoding="ascii").splitlines():
+        if not line or line.startswith("#"):
+            continue
+        key, _, value = line.partition("=")
+        if key in ("rows", "cols"):
+            rows, cols = (int(value), cols) if key == "rows" else (rows, int(value))
+        else:
+            parts[key].append(value)
+    fixed = np.frombuffer(bytes.fromhex("".join(parts["fixed"])), np.uint8).reshape(rows // 16, -1)
+    exc = np.array([int(w, 16) for w in parts["exceptions"]], np.uint32)
+    want = np.frombuffer(bytes.fromhex("".join(parts["expected"])), np.uint8).reshape(rows, cols)
+    return rows, cols, fixed, exc, want
+
+
+class CsfCodecTest(unittest.TestCase):
+    """`csf_scales` against frozen streams.  The expected bytes are the independent decoder in Strata's
+    tools/nvfp4_local_pack.py, which follows the same published format (vLLM PR 60646, flashinfer's b12x kernel,
+    codec byte-window4-fixed-stream-u24-exceptions/1), so the fixture checks the format and not just ourselves.
+    The streams are synthetic scale bytes, not a checkpoint's data."""
+
+    def cases(self):
+        self.assertTrue(CSF_DIR.is_dir(), f"{CSF_DIR} is missing: the CSF fixtures are a required input")
+        cases = sorted(CSF_DIR.glob("*.txt"))
+        self.assertEqual(len(cases), 3, f"expected three CSF fixtures in {CSF_DIR}, found {len(cases)}")
+        return cases
+
+    def test_frozen_streams_decode_to_the_frozen_bytes(self):
+        for path in self.cases():
+            rows, cols, fixed, exc, want = csf_fixture(path)
+            np.testing.assert_array_equal(C.csf_scales(fixed, exc, rows, cols), want, err_msg=path.name)
+
+    def test_the_exception_stream_is_load_bearing(self):
+        rows, cols, fixed, exc, want = csf_fixture(CSF_DIR / "window.txt")
+        self.assertTrue(exc.size, "the frozen window case should carry exception words")
+        without = C.csf_scales(fixed, np.zeros(0, np.uint32), rows, cols)
+        self.assertFalse(np.array_equal(without, want), "an empty exception stream must not give the expected bytes")
+
+
 GDN = 2 * S.GDN_K_HEADS * S.GDN_HEAD + S.GDN_V_HEADS * S.GDN_HEAD      # q, k, then the value channels
 
 
@@ -425,6 +471,22 @@ class UnexpectedTensorTest(unittest.TestCase):
         d = self.build({k: ("BF16", (2,), bytes(4))})
         with self.assertRaisesRegex(S.ConvertError, "unexpected expert tensor"):
             C.CheckpointExperts(C.Checkpoint(d))
+
+    def test_csf_exceptions_must_be_one_dimensional(self):
+        """The word count is read from the tensor's first dimension, so a 2-D exception stream would decode only
+        its first row's words - a shorter exception list that still leaves plausible scales."""
+        rng = np.random.default_rng(11)
+        s = rng.integers(1, 0x7F, size=(64, 8), dtype=np.uint8)          # gate_proj of CFG: ff rows, h / 16 columns
+        fixed, exc = csf_encode(s, 6)
+        exc = exc[:exc.size - exc.size % 2]
+        self.assertTrue(exc.size, "the lifted window should need exceptions")
+        p = "model.language_model.layers.0.mlp.experts.0.gate_proj."
+        both = {p + "weight_scale.nvfp4_csf_fixed": ("U8", fixed.shape, fixed.tobytes()),
+                p + "weight_scale.nvfp4_csf_exceptions": ("U32", (exc.size,), exc.astype("<u4").tobytes())}
+        C.CheckpointExperts(C.Checkpoint(self.build(extra=both)))        # the shape a checkpoint really writes
+        both[p + "weight_scale.nvfp4_csf_exceptions"] = ("U32", (exc.size // 2, 2), exc.astype("<u4").tobytes())
+        with self.assertRaisesRegex(S.ConvertError, "csf_exceptions.*1-D"):
+            C.CheckpointExperts(C.Checkpoint(self.build(extra=both)))
 
     def test_tensor_in_a_non_shard_file(self):
         with self.assertRaisesRegex(S.ConvertError, "extra.safetensors.*dropped"):

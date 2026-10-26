@@ -144,14 +144,61 @@ __device__ __forceinline__ void dm_group_keys(const int32_t* s_key, int n, int t
     rank_out = rank;
 }
 
-// The tier of entry `tid`: CUDA0, the peer, a further peer (3 + q) or the CPU pool (-1).
-__device__ __forceinline__ int dm_tier(const DmRouteArgs& a, int32_t e) {
-    if (a.res0[e] >= 0) return 0;
-    if (a.res1 != nullptr && a.res1[e] >= 0) return 2;
+// The staged share (a card without peers): of the layer's distinct CPU misses (an entry of kind -1 that is its expert's
+// first such entry), the last stage_k[m] in routing order whose blob has a host-RAM address go to kind 1 with every
+// entry of theirs (m: the layer's distinct CPU misses).  Every thread of the block calls it; q is kDmCap words of
+// block scratch.  The ring's kinds and the staged copy (dm_stage_kernel) make the same split from the same ids and
+// residency.
+__device__ void dm_stage_split(const DmRouteArgs& a, const int32_t* s_ids, int32_t* s_kind, int n, int tid, int32_t* q) {
+    if (a.stage_src == nullptr) return;
+    const bool in = tid < n;
+    const int32_t e = in ? s_ids[tid] : -1;
+    const bool miss = in && s_kind[tid] < 0 && e >= 0 && e < a.n_expert;
+    bool first = miss;
+    for (int j = 0; first && j < tid; ++j)
+        if (s_ids[j] == e && s_kind[j] < 0) first = false;
+    if (tid < kDmCap) q[tid] = first;
+    __syncthreads();
+    int m = 0;
+    for (int j = 0; j < n; ++j) m += q[j];
+    const int k = a.stage_k[m];
+    if (k <= 0) {
+        __syncthreads();
+        return;
+    }
+    bool el = first && a.stage_src[e] != 0ull;
+    for (int j = 0; el && j < n; ++j)   // a group holds one entry per token
+        if (j != tid && s_ids[j] == e && j / a.k == tid / a.k) el = false;
+    __syncthreads();
+    if (tid < kDmCap) q[tid] = el;
+    __syncthreads();
+    bool st = false;
+    if (el) {
+        int after = 0;
+        for (int j = tid + 1; j < n; ++j) after += q[j];
+        st = after < k;
+    }
+    __syncthreads();
+    if (tid < kDmCap) q[tid] = st;
+    __syncthreads();
+    bool staged = false;
+    for (int j = 0; miss && j < n; ++j)
+        if (q[j] && s_ids[j] == e) staged = true;
+    __syncthreads();
+    if (staged) s_kind[tid] = 1;
+    __syncthreads();
+}
+
+// The tier of expert e from CUDA0's and the peer's residency rows res0 / res1 (global or shared memory; res1 null: no
+// peer) and the further peers' rows: CUDA0, the peer, a further peer (3 + q) or the CPU pool (-1).
+__device__ __forceinline__ int dm_tier_rows(const DmRouteArgs& a, const int32_t* res0, const int32_t* res1, int32_t e) {
+    if (res0[e] >= 0) return 0;
+    if (res1 != nullptr && res1[e] >= 0) return 2;
     for (int q = 0; q < a.n_x; ++q)
         if (a.xres[q][e] >= 0) return 3 + q;
     return -1;
 }
+__device__ __forceinline__ int dm_tier(const DmRouteArgs& a, int32_t e) { return dm_tier_rows(a, a.res0, a.res1, e); }
 
 // The further peers' ring headers: each holds its own entries as kind 2 and every other GPU's as 0.
 __device__ void dm_xring_headers(const DmRouteArgs& a, const int32_t* ids, const int32_t* kind, int n, int tid,
@@ -218,6 +265,7 @@ __global__ void __launch_bounds__(kDmThreads) dm_route_kernel(DmRouteArgs a) {
         if (pe && rank >= a.peer_cap) s_kind[tid] = -1;
         __syncthreads();
     }
+    dm_stage_split(a, s_ids, s_kind, n, tid, s_first);
     if (tid < n) {
         if (s_kind[tid] < 0) atomicAdd(&s_ncpu, 1);
         else if (s_kind[tid] == 2) atomicAdd(&s_npeer, 1);
@@ -339,6 +387,62 @@ __global__ void __launch_bounds__(kDmThreads) dm_route_kernel(DmRouteArgs a) {
     }
 }
 
+// The staged share's copy and plan (dec_moe_stage): every block derives the layer's kinds (the ring's on a card without
+// peers) and the split, then copies its part of each staged blob from host RAM into its staging slot, whole 128-byte
+// lines (a blob starts 16-byte aligned: its first line holds the bytes before it); block 0 writes the staged groups.
+constexpr int kDmStageUnroll = 4;
+__global__ void __launch_bounds__(kDmThreads) dm_stage_kernel(DmRouteArgs a, uint8_t* staging, long long stride,
+                                                              long long blob) {
+    __shared__ int32_t s_ids[kDmCap], s_kind[kDmCap], s_first[kDmCap], s_cnt[kDmCap], s_gstart[kDmCap];
+    __shared__ int32_t s_gidx[kDmCap], s_pos[kDmCap], s_start[kDmCap + 1];
+    __shared__ int32_t s_ng, s_ne;
+    __shared__ unsigned long long s_src[kDmStageMax];
+    const int tid = threadIdx.x, n = a.n_tok * a.k;
+    if (tid < n) s_ids[tid] = __ldcg(a.ids + tid);
+    __syncthreads();
+    if (tid < n) {
+        const int32_t e = s_ids[tid];
+        bool ok = e >= 0 && e < a.n_expert;
+        for (int j = tid - tid % a.k; ok && j < tid; ++j) ok = s_ids[j] != e;
+        s_kind[tid] = ok && a.res0[e] >= 0 ? 0 : -1;
+    }
+    __syncthreads();
+    dm_stage_split(a, s_ids, s_kind, n, tid, s_first);
+    dm_group(s_ids, s_kind, n, 1, tid, s_first, s_cnt, s_gstart, s_gidx, s_pos, s_start, &s_ng, &s_ne);
+    const int ng = min(s_ng, kDmStageMax);
+    if (tid < n && s_first[tid] && s_gidx[tid] < kDmStageMax) s_src[s_gidx[tid]] = a.stage_src[s_ids[tid]];
+    __syncthreads();
+    if (blockIdx.x == 0) {
+        DmPlan* p = a.plan;
+        if (tid < n && s_kind[tid] == 1 && s_pos[tid] >= 0) {
+            p->sdst[s_pos[tid]] = tid;
+            p->stok[s_pos[tid]] = tid / a.k;
+        }
+        if (tid <= ng) p->sstart[tid] = s_start[tid];
+        if (tid < ng) p->sptr[tid] = (unsigned long long) (staging + (long long) tid * stride) + (s_src[tid] & 127ull);
+        if (tid == 0) {
+            p->scounts[0] = ng;
+            p->scounts[1] = s_ne;
+        }
+    }
+    const long long step = (long long) gridDim.x * kDmThreads;
+    for (int g = 0; g < ng; ++g) {
+        const unsigned long long src = s_src[g];
+        const uint4* s = (const uint4*) (src & ~127ull);
+        uint4* d = (uint4*) (staging + (long long) g * stride);
+        const long long chunks = (long long) ((src + (unsigned long long) blob + 127ull) / 128ull - src / 128ull) * 8;
+        long long i = (long long) blockIdx.x * kDmThreads + tid;
+        for (; i + (kDmStageUnroll - 1) * step < chunks; i += kDmStageUnroll * step) {
+            uint4 v[kDmStageUnroll];
+#pragma unroll
+            for (int u = 0; u < kDmStageUnroll; ++u) v[u] = __ldcv(s + i + u * step);
+#pragma unroll
+            for (int u = 0; u < kDmStageUnroll; ++u) d[i + u * step] = v[u];
+        }
+        for (; i < chunks; i += step) d[i] = __ldcv(s + i);
+    }
+}
+
 // both tiers' words polled together, each one's landing time kept (S[2] the peer, S[4] the CPU pool, S[3] both)
 __device__ void dm_poll_tiers(const DmPlan* plan, const volatile uint32_t* peer_done, const volatile uint32_t* host_flag,
                               uint32_t ring, unsigned long long* S) {
@@ -369,22 +473,18 @@ __global__ void dm_wait_kernel(const DmPlan* plan, const volatile uint32_t* peer
 }
 
 // ---------------------------------------------------------------- DEC_GLUE & 1: the route inside gate/up
-// DEC_GLUE & 2: dm_route_kernel's mode 2 (with kinds) in one block, the mapped q8_1 rows copied from `xq` (the
-// same q8_1_store bits); called after the block's pdl_wait
-__device__ void dm_glue_ring(const DmRouteArgs& a, const void* xq, int tid) {
-    __shared__ int32_t r_ids[kDmCap], r_kind[kDmCap], r_pf[kDmCap];
-    __shared__ int32_t r_ncpu, r_npeer, r_nvram, r_nx[kDmMaxX];
+// dm_route_kernel's mode 2 kinds (with the peer's cap) for the ring's entries r_ids (shared memory) from the
+// residency rows res0 / res1 (dm_tier_rows), the counts into r_cnt (zeroed: CPU, peer, VRAM, then each further
+// peer's), then the ring's header and every entry's kind (mapped, the further peers' rings, and the plan's with
+// a.kinds).  Ends without a barrier after the header's stores.
+__device__ void dm_ring_head(const DmRouteArgs& a, const int32_t* res0, const int32_t* res1, int tid,
+                             const int32_t* r_ids, int32_t* r_kind, int32_t* r_pf, int32_t* r_cnt) {
     const int n = a.n_tok * a.k;
-    if (tid == 0) { r_ncpu = 0; r_npeer = 0; r_nvram = 0; }
-    if (tid < kDmMaxX) r_nx[tid] = 0;
-    const int n16 = a.n_tok * (a.n_embd / 32) * 36 / 16;
-    if (tid < n) r_ids[tid] = __ldcg(a.ids + tid);
-    __syncthreads();
     if (tid < n) {
         const int32_t e = r_ids[tid];
         bool ok = e >= 0 && e < a.n_expert;
         for (int j = tid - tid % a.k; ok && j < tid; ++j) ok = r_ids[j] != e;
-        r_kind[tid] = ok ? dm_tier(a, e) : -1;
+        r_kind[tid] = ok ? dm_tier_rows(a, res0, res1, e) : -1;
     }
     __syncthreads();
     if (a.peer_cap > 0) {   // dm_route_kernel's cap: the peer's groups past peer_cap go to the CPU pool
@@ -402,16 +502,17 @@ __device__ void dm_glue_ring(const DmRouteArgs& a, const void* xq, int tid) {
         if (pe && rank >= a.peer_cap) r_kind[tid] = -1;
         __syncthreads();
     }
+    dm_stage_split(a, r_ids, r_kind, n, tid, r_pf);
     if (tid < n) {
-        if (r_kind[tid] < 0) atomicAdd(&r_ncpu, 1);
-        else if (r_kind[tid] == 2) atomicAdd(&r_npeer, 1);
-        else if (r_kind[tid] >= 3) atomicAdd(&r_nx[r_kind[tid] - 3], 1);
-        else atomicAdd(&r_nvram, 1);
+        if (r_kind[tid] < 0) atomicAdd(&r_cnt[0], 1);
+        else if (r_kind[tid] == 2) atomicAdd(&r_cnt[1], 1);
+        else if (r_kind[tid] >= 3) atomicAdd(&r_cnt[r_kind[tid]], 1);   // further peer q at 3 + q
+        else atomicAdd(&r_cnt[2], 1);
     }
     __syncthreads();
-    int npeers = r_npeer;   // every peer's entries
-    for (int q = 0; q < a.n_x; ++q) npeers += r_nx[q];
-    dm_xring_headers(a, r_ids, r_kind, n, tid, r_nx, r_nvram, r_ncpu);
+    int npeers = r_cnt[1];   // every peer's entries
+    for (int q = 0; q < a.n_x; ++q) npeers += r_cnt[3 + q];
+    dm_xring_headers(a, r_ids, r_kind, n, tid, r_cnt + 3, r_cnt[2], r_cnt[0]);
     if (tid < n) {
         a.ring_m->ids[tid] = r_ids[tid];
         a.ring_m->kind[tid] = r_kind[tid];
@@ -421,18 +522,32 @@ __device__ void dm_glue_ring(const DmRouteArgs& a, const void* xq, int tid) {
         DmRing* r = a.ring_m;
         r->n_tok = a.n_tok;
         r->layer = a.layer;
-        r->n_vram = r_nvram;
-        r->n_peer = r_npeer;
-        r->n_cpu = r_ncpu;
+        r->n_vram = r_cnt[2];
+        r->n_peer = r_cnt[1];
+        r->n_cpu = r_cnt[0];
         if (a.kinds) {
             a.plan->counts[2] = npeers;
-            a.plan->counts[3] = r_ncpu;
+            a.plan->counts[3] = r_cnt[0];
         }
     }
+}
+
+// DEC_GLUE & 2: dm_route_kernel's mode 2 (with kinds) in one block, the mapped q8_1 rows copied from `xq` (the
+// same q8_1_store bits); called after the block's pdl_wait
+__device__ void dm_glue_ring(const DmRouteArgs& a, const void* xq, int tid) {
+    __shared__ int32_t r_ids[kDmCap], r_kind[kDmCap], r_pf[kDmCap], r_cnt[3 + kDmMaxX];
+    const int n = a.n_tok * a.k;
+    if (tid < 3 + kDmMaxX) r_cnt[tid] = 0;
+    const int n16 = a.n_tok * (a.n_embd / 32) * 36 / 16;
+    if (tid < n) r_ids[tid] = __ldcg(a.ids + tid);
+    __syncthreads();
+    dm_ring_head(a, a.res0, a.res1, tid, r_ids, r_kind, r_pf, r_cnt);
+    int npeers = r_cnt[1];
+    for (int q = 0; q < a.n_x; ++q) npeers += r_cnt[3 + q];
     if (npeers > 0 || a.rows) {   // the q8_1 rows, 16 bytes at a time (a row is n_embd / 32 blocks of 36 bytes)
         for (int i = tid; i < n16; i += blockDim.x) ((uint4*) a.xq_m)[i] = __ldcg((const uint4*) xq + i);
     }
-    if (r_ncpu > 0) {
+    if (r_cnt[0] > 0) {
         const int n4 = a.n_tok * a.n_embd / 4;
         for (int i = tid; i < n4; i += blockDim.x) ((float4*) a.x_m)[i] = __ldcg((const float4*) a.x + i);
     }
@@ -441,9 +556,79 @@ __device__ void dm_glue_ring(const DmRouteArgs& a, const void* xq, int tid) {
     if (tid == 0) {
         if (a.stats != nullptr) a.stats[0] = dm_clock();
         __threadfence_system();
-        *(volatile uint32_t*) a.peer_seq_m = a.ring | (uint32_t) a.n_tok << 16 | (r_npeer > 0 ? 1u << 28 : 0u) |
+        *(volatile uint32_t*) a.peer_seq_m = a.ring | (uint32_t) a.n_tok << 16 | (r_cnt[1] > 0 ? 1u << 28 : 0u) |
                                              (a.rows ? 1u << 29 : 0u);
-        dm_xring_doorbells(a, r_nx);
+        dm_xring_doorbells(a, r_cnt + 3);
+        *(volatile uint32_t*) a.host_seq_m = a.ring;
+        __threadfence_system();
+    }
+}
+
+__device__ __forceinline__ unsigned dm_ld_acquire(const unsigned* p) {
+    unsigned v;
+    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+    return v;
+}
+
+// the layer's landed word, read at the kernel's start (`have`) and spun on only while it is short of `need`
+__device__ __forceinline__ void dm_landed_read(const DmGlueArgs& a, unsigned& need, unsigned& have) {
+    if (a.landed == nullptr) return;
+    need = __ldcg(a.landed_need);
+    have = dm_ld_acquire(a.landed);
+}
+// (the mapped stop word is read once in a while: every block polling it would crowd the link the copies come over)
+__device__ __forceinline__ void dm_landed_wait(const DmGlueArgs& a, unsigned need, unsigned have) {
+    if (a.landed == nullptr || have >= need) return;
+    for (unsigned i = 1; dm_ld_acquire(a.landed) < need; ++i) {
+        if ((i & 1023u) == 0u && a.landed_stop != nullptr && *(const volatile unsigned*) a.landed_stop == 0xffffffffu) break;
+        __nanosleep(128);
+    }
+}
+
+// The ring's block after a read that counts its progress (DmRouteArgs::pub_ctr), started with the read: the layer's
+// residency rows into shared memory (s_res: 2 * n_expert words); once the up slices are through, every token's FFN
+// input rows to mapped memory while the router runs; once the router items have written xq, its q8_1 rows while the
+// top-10 runs; once the ids are out, the kinds and the header, then one fence and every doorbell.  It reads nothing the
+// read writes before those counts, so it needs no pdl_wait; with `reset` it zeroes them for the layer's next window.
+__device__ void dm_glue_ring_pub(const DmRouteArgs& a, const void* xq, int tid, int32_t* s_res, bool reset) {
+    __shared__ int32_t r_ids[kDmCap], r_kind[kDmCap], r_pf[kDmCap], r_cnt[3 + kDmMaxX];
+    const int n = a.n_tok * a.k;
+    int32_t* const res0 = s_res;
+    int32_t* const res1 = a.res1 != nullptr ? s_res + a.n_expert : nullptr;
+    for (int i = tid; i < a.n_expert; i += blockDim.x) {
+        res0[i] = a.res0[i];
+        if (res1 != nullptr) res1[i] = a.res1[i];
+    }
+    if (tid < 3 + kDmMaxX) r_cnt[tid] = 0;
+    if (tid == 0)
+        while (dm_ld_acquire(a.pub_ctr + 2) == 0u) __nanosleep(32);
+    __syncthreads();
+    const int n4 = a.n_tok * (a.n_embd / 4);   // the FFN input rows the CPU pool reads, 16 bytes at a time
+    for (int i = tid; i < n4; i += blockDim.x) ((float4*) a.x_m)[i] = __ldcg((const float4*) a.x + i);
+    if (tid == 0)
+        while (dm_ld_acquire(a.pub_ctr) < a.pub_target) __nanosleep(32);
+    __syncthreads();
+    const int n16 = a.n_tok * (a.n_embd / 32) * 36 / 16;   // the q8_1 rows, 16 bytes at a time
+    for (int i = tid; i < n16; i += blockDim.x) ((uint4*) a.xq_m)[i] = __ldcg((const uint4*) xq + i);
+    if (tid == 0) {
+        while (dm_ld_acquire(a.pub_ctr + 1) == 0u) __nanosleep(32);
+        if (reset) {
+            a.pub_ctr[0] = 0u;
+            a.pub_ctr[1] = 0u;
+            a.pub_ctr[2] = 0u;
+        }
+    }
+    __syncthreads();
+    if (tid < n) r_ids[tid] = __ldcg(a.ids + tid);
+    __syncthreads();
+    dm_ring_head(a, res0, res1, tid, r_ids, r_kind, r_pf, r_cnt);
+    __threadfence_system();
+    __syncthreads();
+    if (tid == 0) {
+        if (a.stats != nullptr) a.stats[0] = dm_clock();
+        *(volatile uint32_t*) a.peer_seq_m = a.ring | (uint32_t) a.n_tok << 16 | (r_cnt[1] > 0 ? 1u << 28 : 0u) |
+                                             (a.rows ? 1u << 29 : 0u);
+        dm_xring_doorbells(a, r_cnt + 3);
         *(volatile uint32_t*) a.host_seq_m = a.ring;
         __threadfence_system();
     }
@@ -475,6 +660,10 @@ __global__ void __launch_bounds__(256, 2) dm_glue_gu_kernel(DmGlueArgs a, Native
     if (!lead) pdl_trigger();   // the lead block lets the SwiGLU and down launches start once the plan is out
     const int nwork = (int) gridDim.x - (a.ring_on ? 1 : 0);
     if (a.ring_on && (int) blockIdx.x == nwork) {   // the ring's block
+        if (a.ring.pub_ctr != nullptr) {
+            dm_glue_ring_pub(a.ring, a.xq, tid, (int32_t*) s_tab, true);
+            return;
+        }
         if (tid < 32 && tid * 32 < a.n_expert) {   // the layer's residency rows into L2
             asm volatile("prefetch.global.L2 [%0];" ::"l"(a.ring.res0 + tid * 32));
             if (a.ring.res1 != nullptr) asm volatile("prefetch.global.L2 [%0];" ::"l"(a.ring.res1 + tid * 32));
@@ -483,6 +672,8 @@ __global__ void __launch_bounds__(256, 2) dm_glue_gu_kernel(DmGlueArgs a, Native
         dm_glue_ring(a.ring, a.xq, tid);
         return;
     }
+    unsigned lw_need = 0u, lw_have = 0u;
+    if (tid == 0) dm_landed_read(a, lw_need, lw_have);
     for (int i = tid; i < a.n_expert; i += 256) s_tab[i] = 0u;
     if (tid == 0) s_dup = 0;
     const uint32_t* s_grid = gu2::stage_grid<TG>(s_grid_buf, tid);
@@ -491,6 +682,7 @@ __global__ void __launch_bounds__(256, 2) dm_glue_gu_kernel(DmGlueArgs a, Native
     const int tok = tid / a.k, warp = tid >> 5, lane = tid & 31;
     __syncthreads();   // the masks are zero before any entry marks one
     pdl_wait();
+    if (tid == 0) dm_landed_wait(a, lw_need, lw_have);   // before the plan: no launch after this one reads a blob early
     // the table entry is read at once; the marking and the barrier hide its latency
     const int32_t e0 = tid < n ? __ldcg(a.ids + tid) : -1;
     const bool inr = e0 >= 0 && e0 < a.n_expert;
@@ -664,7 +856,30 @@ __global__ void __launch_bounds__(256, 4) dm_glue_gu1_kernel(DmGlueArgs a, Nativ
     const bool lead = blockIdx.x == 0;
     if (!lead) pdl_trigger();
     const int nwork = (int) gridDim.x - (a.ring_on ? 1 : 0);
+    // after a read that counts its progress the blocks start on its counts, not its end, and the last block of the
+    // launch to finish (the ring's block among them) zeroes the counts
+    const bool counted = a.ring_on && a.ring.pub_ctr != nullptr;
+    const unsigned finishers = (unsigned) nwork + (counted ? 1u : 0u);
+    auto finish = [&] {
+        if (tid == 0) {
+            __threadfence();
+            if (atomicAdd(&g_dm_glue1_work[1], 1u) == finishers - 1u) {
+                g_dm_glue1_work[0] = 0u;
+                g_dm_glue1_work[1] = 0u;
+                if (counted) {
+                    a.ring.pub_ctr[0] = 0u;
+                    a.ring.pub_ctr[1] = 0u;
+                    a.ring.pub_ctr[2] = 0u;
+                }
+            }
+        }
+    };
     if (a.ring_on && blockIdx.x == 1) {   // the ring's block
+        if (counted) {
+            dm_glue_ring_pub(a.ring, a.xq, tid, (int32_t*) s_tab, false);
+            finish();
+            return;
+        }
         if (tid < 32 && tid * 32 < a.n_expert) {   // the layer's residency rows into L2
             asm volatile("prefetch.global.L2 [%0];" ::"l"(a.ring.res0 + tid * 32));
             if (a.ring.res1 != nullptr) asm volatile("prefetch.global.L2 [%0];" ::"l"(a.ring.res1 + tid * 32));
@@ -674,13 +889,25 @@ __global__ void __launch_bounds__(256, 4) dm_glue_gu1_kernel(DmGlueArgs a, Nativ
         return;
     }
     const int wb = (int) blockIdx.x - (a.ring_on && blockIdx.x > 1 ? 1 : 0);   // the block's place among the workers
+    unsigned lw_need = 0u, lw_have = 0u;
+    if (tid == 0) dm_landed_read(a, lw_need, lw_have);
     for (int i = tid; i < a.n_expert; i += 256) s_tab[i] = 0u;
     if (tid == 0) s_dup = 0;
     if (tid == 0 && wb * 16 < a.n_expert)   // the layer's table into L2
         asm volatile("prefetch.global.L2 [%0];" ::"l"(a.ptab + wb * 16));
     const int tok = tid / a.k, warp = tid >> 5, lane = tid & 31;
-    __syncthreads();
-    pdl_wait();
+    if (counted) {   // xq and the ids are out once both counts are in
+        if (tid == 0) {
+            while (dm_ld_acquire(a.ring.pub_ctr) < a.ring.pub_target) __nanosleep(32);
+            while (dm_ld_acquire(a.ring.pub_ctr + 1) == 0u) __nanosleep(32);
+            dm_landed_wait(a, lw_need, lw_have);   // before the plan: no launch after this one reads a blob early
+        }
+        __syncthreads();
+    } else {
+        __syncthreads();
+        pdl_wait();
+        if (tid == 0) dm_landed_wait(a, lw_need, lw_have);
+    }
     const int32_t e0 = tid < n ? __ldcg(a.ids + tid) : -1;
     const bool inr = e0 >= 0 && e0 < a.n_expert;
     const unsigned long long praw = inr ? a.ptab[e0] : 0ull;
@@ -757,13 +984,7 @@ __global__ void __launch_bounds__(256, 4) dm_glue_gu1_kernel(DmGlueArgs a, Nativ
         __syncthreads();
         it = s_next[i & 1];
     }
-    if (tid == 0) {
-        __threadfence();
-        if (atomicAdd(&g_dm_glue1_work[1], 1u) == (unsigned) nwork - 1u) {
-            g_dm_glue1_work[0] = 0u;
-            g_dm_glue1_work[1] = 0u;
-        }
-    }
+    finish();
 }
 
 template<int TG> int dm_glue1_blocks() {
@@ -1138,8 +1359,9 @@ __device__ __forceinline__ unsigned int dm_ld(const unsigned int* p) { return *(
 // rows (int8 rows, a prediction only), every token's top k, the predicted experts the peer holds rank by rank (logits,
 // list: the scratch past the counters), then one plain-load pass over those blobs so the next ring's expert reads find
 // them in the L2.  Each part is skipped or cut short once the doorbell is in (kDmWarmGo).  Writes nothing the rings
-// read.  Not inlined: the rings' expert loop keeps its own register allocation.
-__device__ __noinline__ void dm_warm(const DmPeerArgs& a, DmShared& sm, const block_q8_1* xq, int n_tok, int layer,
+// read.  Not inlined: the rings' expert loop keeps its own register allocation.  `a` is taken by value: a reference to
+// the kernel parameter makes ptxas build a local copy that the non-inlined callee reads through an unset base.
+__device__ __noinline__ void dm_warm(DmPeerArgs a, DmShared& sm, const block_q8_1* xq, int n_tok, int layer,
                                      uint32_t next, float* logits, unsigned long long* list, unsigned int ring_arrivals) {
     __shared__ int32_t s_last, s_go;   // block-uniform decisions (go moves while the block reads it)
     __shared__ unsigned int s_n;
@@ -1510,9 +1732,21 @@ __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
                 const uint4* xs = (const uint4*) (a.xq_m + (size_t) s * a.xq_stride);
                 constexpr int h16 = (int) (sizeof(DmRing) / 16);
                 const int n16 = h16 + min(nt, kVerifyMaxT) * (a.n_embd / 32) * (int) sizeof(block_q8_1) / 16;
-                for (int i = tid; i < n16; i += kDmThreads) {
-                    if (i < h16) ((uint4*) hdr)[i] = __ldcv(src + i);
-                    else ((uint4*) xq)[i - h16] = __ldcv(xs + (i - h16));
+                // a thread's loads all go out before its first store: one round trip over the link, not one a pass
+                constexpr int kLd = 4;
+                for (int i0 = tid; i0 < n16; i0 += kLd * kDmThreads) {
+                    uint4 t[kLd];
+#pragma unroll
+                    for (int r = 0; r < kLd; ++r) {
+                        const int i = i0 + r * kDmThreads;
+                        if (i < n16) t[r] = __ldcv(i < h16 ? src + i : xs + (i - h16));
+                    }
+#pragma unroll
+                    for (int r = 0; r < kLd; ++r) {
+                        const int i = i0 + r * kDmThreads;
+                        if (i < h16) ((uint4*) hdr)[i] = t[r];
+                        else if (i < n16) ((uint4*) xq)[i - h16] = t[r];
+                    }
                 }
             } else if (tid == 0) {
                 hdr->n_tok = 0;
@@ -1532,16 +1766,19 @@ __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
         }
         const int n_tok = min(hdr->n_tok, kVerifyMaxT), layer = hdr->layer, n = n_tok * a.k;
         w.layer = layer; w.n_tok = n_tok; w.n = n;
+        unsigned long long blob = 0ull;   // a peer entry's blob, loaded while the block groups
         if (tid < n) {
-            sm.ids[tid] = hdr->ids[tid];
-            sm.kind[tid] = hdr->kind[tid];
+            const int32_t id = hdr->ids[tid], kd = hdr->kind[tid];
+            sm.ids[tid] = id;
+            sm.kind[tid] = kd;
+            if (kd == 2) blob = a.ptr[(size_t) layer * a.n_expert + id];
         }
         __syncthreads();
         dm_group(sm.ids, sm.kind, n, 2, tid, sm.first, sm.cnt, sm.gstart, sm.gidx, sm.pos, sm.start, &sm.ng, &sm.ne);
         if (tid < n && sm.kind[tid] == 2) {
             sm.tok[sm.pos[tid]] = tid / a.k;
             sm.dst[sm.pos[tid]] = tid;
-            if (sm.first[tid]) sm.gptr[sm.gidx[tid]] = a.ptr[(size_t) layer * a.n_expert + sm.ids[tid]];
+            if (sm.first[tid]) sm.gptr[sm.gidx[tid]] = blob;
         }
         __syncthreads();
         // a group of more entries than the shared rows hold (a ring the route kernel did not write) aborts the window
@@ -1926,6 +2163,18 @@ void dec_moe_route(const DmRouteArgs& a, void* stream) {
     check("dec_moe_route");
 }
 
+void dec_moe_stage(const DmRouteArgs& a, uint8_t* staging, int64_t stride, int64_t blob_bytes, int blocks, void* stream) {
+    if (a.n_tok * a.k > kDmCap || a.stage_src == nullptr || a.stage_k == nullptr || blob_bytes % 16 != 0 ||
+        stride % 128 != 0 || stride < dec_moe_stage_stride(blob_bytes) || blocks < 1) {
+        basalt::log::error("basalt", "dec_moe_stage: %d entries, blob %lld, stride %lld", a.n_tok * a.k,
+                           (long long) blob_bytes, (long long) stride);
+        std::exit(1);
+    }
+    dm_stage_kernel<<<(unsigned) blocks, kDmThreads, 0, (cudaStream_t) stream>>>(a, staging, (long long) stride,
+                                                                                (long long) blob_bytes);
+    check("dec_moe_stage");
+}
+
 bool dec_moe_glue_ok(const NativeExpertLayout& L) {
     const bool tg = L.gu_type == 16 || L.gu_type == 17 || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 ||
                     L.gu_type == 42;
@@ -1943,7 +2192,8 @@ bool dec_moe_glue_ok(const NativeExpertLayout& L) {
 
 void dec_moe_glue(const NativeExpertLayout& L, const DmGlueArgs& a_in, void* scratch, float* out, int cap, void* stream) {
     const DmGlueArgs& a = a_in;
-    if (a.n_tok * a.k > kDmCap || cap < 1 || cap > kDmCap || a.n_tok > kDmGlueTokens || a.n_expert > kDmGlueExperts) {
+    if (a.n_tok * a.k > kDmCap || cap < 1 || cap > kDmCap || a.n_tok > kDmGlueTokens || a.n_expert > kDmGlueExperts ||
+        (a.ring_on && a.ring.pub_ctr != nullptr && 2 * a.n_expert > kDmGlueExperts)) {
         basalt::log::error("basalt", "dec_moe_glue: %d entries, cap %d, %d tokens, %d experts", a.n_tok * a.k, cap, a.n_tok,
                      a.n_expert);
         std::exit(1);
@@ -2178,6 +2428,56 @@ bool dec_moe_peer_launch(const DmPeerArgs& a, int blocks, void* stream, bool q2)
                                                       dim3(kDmThreads), params, 0, (cudaStream_t) stream);
     if (e != cudaSuccess) {
         basalt::log::error("basalt", "dec_moe_peer_launch: %s", cudaGetErrorString(e));
+        return false;
+    }
+    return true;
+}
+
+__global__ void dm_table_put_kernel(const __grid_constant__ DmTablePut a) {
+    for (int i = (int) threadIdx.x; i < a.n; i += (int) blockDim.x) a.tab[a.idx[i]] = a.val[i];
+}
+
+__global__ void dm_zero_words_kernel(unsigned int* p, int n) {
+    if ((int) threadIdx.x < n) p[threadIdx.x] = 0u;
+}
+
+bool dec_moe_table_put(const DmTablePut& a, void* stream) {
+    if (a.n <= 0) return true;
+    void* params[] = {(void*) &a};
+    const cudaError_t e = cudaLaunchKernel((const void*) dm_table_put_kernel, dim3(1), dim3(128), params, 0,
+                                           (cudaStream_t) stream);
+    if (e != cudaSuccess) {
+        basalt::log::error("basalt", "dec_moe_table_put: %s", cudaGetErrorString(e));
+        return false;
+    }
+    return true;
+}
+
+bool dec_moe_table_load(void* stream) {
+    DmTablePut a;
+    unsigned int* p = nullptr;
+    int n = 0;
+    void* pa[] = {(void*) &a};
+    void* pz[] = {(void*) &p, (void*) &n};
+    const cudaError_t e = cudaLaunchKernel((const void*) dm_table_put_kernel, dim3(1), dim3(128), pa, 0,
+                                           (cudaStream_t) stream);
+    const cudaError_t f = e != cudaSuccess ? e : cudaLaunchKernel((const void*) dm_zero_words_kernel, dim3(1), dim3(256),
+                                                                    pz, 0, (cudaStream_t) stream);
+    if (f != cudaSuccess) {
+        basalt::log::error("basalt", "dec_moe_table_load: %s", cudaGetErrorString(f));
+        return false;
+    }
+    return true;
+}
+
+bool dec_moe_zero_words(unsigned int* p, int n, void* stream) {
+    if (n <= 0) return true;
+    if (n > 256) return false;
+    void* params[] = {(void*) &p, (void*) &n};
+    const cudaError_t e = cudaLaunchKernel((const void*) dm_zero_words_kernel, dim3(1), dim3(256), params, 0,
+                                           (cudaStream_t) stream);
+    if (e != cudaSuccess) {
+        basalt::log::error("basalt", "dec_moe_zero_words: %s", cudaGetErrorString(e));
         return false;
     }
     return true;

@@ -27,6 +27,7 @@ from serve.config import (  # noqa: E402
     sampling_line,
     server_options,
     split_engine_extras,
+    vision_setting,
 )
 from serve.engine.flags import flag_value  # noqa: E402
 from serve.security import exposed_without_key  # noqa: E402
@@ -67,11 +68,11 @@ def engine_parser_flags() -> dict:
 class ConfigFile(unittest.TestCase):
     def test_server_and_engine_sections(self):
         ap = build_parser()
-        argv, engine = load_config_file(conf({"server": {"port": 9000, "vision": "on", "lazy": False,
+        argv, engine = load_config_file(conf({"server": {"port": 9000, "vision": 2, "lazy": False,
                                                          "allowed-host": ["a", "b"], "--gpu": "0,1"},
                                               "engine": {"max-context": 32768, "--kv": "int8",
                                                          "resident-experts": True}}), ap)
-        self.assertEqual(argv, ["--port", "9000", "--vision", "on", "--allowed-host", "a", "--allowed-host", "b",
+        self.assertEqual(argv, ["--port", "9000", "--vision", "2", "--allowed-host", "a", "--allowed-host", "b",
                                 "--gpu", "0,1"])
         self.assertEqual(engine, ["--max-context", "32768", "--kv", "int8", "--resident-experts"])
 
@@ -87,9 +88,9 @@ class ConfigFile(unittest.TestCase):
                          ({"server": {"nope": 1}}, "not a server option"),
                          ({"server": {"spec": 7}}, "not a server option \\(engine flags go under"),
                          ({"server": {"engine-bin": "/x/basalt"}}, "engine-bin is set by basalt serve"),
-                         ({"server": {"vision": "yes"}}, "vision: use one of on, off, peer, dynamic, cpu"),
-                         ({"server": {"vision": True}}, "vision: use one of on, off, peer, dynamic, cpu"),
-                         ({"server": {"vision": False}}, "vision: use one of on, off, peer, dynamic, cpu"),
+                         ({"server": {"vision": "yes"}}, "vision: use one of off, dynamic, cpu or a GPU number"),
+                         ({"server": {"vision": True}}, "vision: use one of off, dynamic, cpu or a GPU number"),
+                         ({"server": {"vision": False}}, "vision: use one of off, dynamic, cpu or a GPU number"),
                          ({"server": {"port": [1]}}, "one value"),
                          ({"server": {"config": "x"}}, "not a server option"),
                          ({"engine": {"port": 1}}, "a server option"),
@@ -215,12 +216,12 @@ class Precedence(unittest.TestCase):
     def test_startup_line(self):
         self.assertEqual(engine_line(["--max-context", "32768", "--resident-experts", "--kv", "int8",
                                       "--control-vector-layer-range", "4", "44"], ["--spec", "7"]),
-                         "[server] engine: --max-context 32768 (config), --resident-experts (config), "
-                         "--kv int8 (config), --control-vector-layer-range 4 44 (config), --spec 7 (cli)")
-        self.assertEqual(engine_line([], ["--spec", "7"]), "[server] engine: --spec 7 (cli)")
+                         "[server] engine   ctx=32768 resident-experts kv=int8 control-vector-layer-range=4,44 "
+                         "(from config)  spec=7 (from cli)")
+        self.assertEqual(engine_line([], ["--spec", "7"]), "[server] engine   spec=7 (from cli)")
         self.assertEqual(engine_line([], [], grammar=(False, "cli")),
-                         "[server] engine: using default flags, grammar off (cli)")
-        self.assertEqual(engine_line([], []), "[server] engine: using default flags")
+                         "[server] engine   grammar=off (from cli)")
+        self.assertEqual(engine_line([], []), "[server] engine   defaults")
 
 
 class SamplingOptions(unittest.TestCase):
@@ -268,7 +269,7 @@ class SamplingOptions(unittest.TestCase):
 
     def test_startup_line_marks_the_source(self):
         self.assertEqual(sampling_line({"temperature": 0.8, "top_k": 20, "top_p": 0.9}, {"temperature"}, {"top_k"}),
-                         "[server] sampling defaults: temperature=0.8 (command line), top_k=20 (config), top_p=0.9")
+                         "[server] sampling temp=0.8(cli) top_k=20(config) top_p=0.9")
 
 
 class ThinkingBudget(unittest.TestCase):
@@ -314,7 +315,7 @@ class SlotContext(unittest.TestCase):
         a, _, file_words, cli_words = parse_settings(ap, ["--parallel", "4", "--max-context", "65536"])
         line = engine_line(file_words, cli_words, (a.shared_context, a.parallel))
         self.assertEqual(flag_value(cli_words, "--max-context"), "16384")
-        self.assertIn("--max-context 16384 (cli: 65536 / 4 slots)", line)
+        self.assertIn("ctx=16384 (65536/4 slots)", line)
         self.assertNotIn("slots", engine_line(file_words, cli_words))
 
     def test_slot_full_context_keeps_the_whole(self):
@@ -331,6 +332,8 @@ class EveryOption(unittest.TestCase):
             return [c for c in act.choices][-1]
         if act.type is int or act.type is parallel_count or act.type is budget_count:
             return 7
+        if act.type is vision_setting:                      # --vision: a GPU number is a valid sample
+            return "1"
         if act.type is float:
             return 0.25
         if act.dest in SAMPLING_KEYS:                      # the model file's checks apply

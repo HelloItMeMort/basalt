@@ -14,7 +14,10 @@ path, used while one request runs alone, has the same length, so a request that 
 one that does not is refused with a 400 naming that length. `/slots`, `/props` and `/v1/models` report the context
 each slot has. `--slot-full-context` (also `"slot-full-context"` in the config's `server` section) gives every slot
 the whole `--max-context` instead, at N times the KV cache; the startup line says so. The slots' KV cache, and one
-solo session of the same length, come out of the expert cache.
+solo session of the same length, come out of the expert cache. Each slot keeps two conversation checkpoints, the end
+of its system prompt and its last turn (each when at least `--prompt-cache-root` tokens lie before it), and a new
+request reads only what follows the longest start it shares with any slot's checkpoint, decoding or idle: requests that
+share a long system prompt read it once.
 
 Every chat, messages and responses request must name the served model in `model`: the alias (or the model's name) that `/v1/models` lists, or the model file's name. An unknown or missing name is a 404 in the API's own error shape, and replies always carry the served name.
 
@@ -24,17 +27,27 @@ cells at startup (the K/V pools, the indexer's block keys, the RoPE tables and t
 rest of that VRAM holds the expert cache's last slots until a request needs it. A request backs its prompt plus 16384 cells before the prompt is read (and 16384 more whenever decode runs past that) by taking
 those slots back; their experts become CPU misses read from their RAM copies, which the RAM copy keeps for exactly this.
 The next request that needs less gives the cells back and the cache refills the slots from RAM. A short request so
-decodes with the cache a 32k context would have, whatever `--max-context` is. The startup line `elastic KV: ...` says
+decodes with the cache a 32k context would have, whatever `--max-context` is. With `--parallel` every slot is elastic
+once its share of the context is above 4096 tokens: it backs 4096 cells at startup and grows by 4096, so idle and short
+slots leave their VRAM to the expert cache. The startup line `elastic KV: ...` says
 how much of the cache is lent this way, and each move is logged (`elastic KV: N cells backed ...`).
 
-While other slots are decoding, a new prompt is read beside them: the prompt path runs on its own thread, the slots'
-decode windows keep running (their kernels take the higher stream priority), and the few steps that touch the draft
-layer or the output run between two windows. A long prompt therefore does not stop the other requests. A prompt that
-arrives while no other slot is decoding is read as in the single-stream path.
+While other slots are decoding, a new prompt of up to 16384 tokens is read at once: the slots wait for it (a few
+seconds at most), and it is read as in the single-stream path: the same chunks and streamed ring, the CPU pool's
+share of its experts. Its first token so comes about as soon as on an idle engine. A longer prompt is read beside them:
+the prompt path runs on its own thread, the slots' decode windows keep running (their kernels take the higher stream
+priority), and the few steps that touch the draft layer or the output run between two windows, so a long prompt does
+not stop the other requests. A prompt that arrives while no other slot is decoding is read as in the single-stream
+path.
 
-At startup the server prints one `[server] kv cache:` line per device with all the session state placed there, for
-example `12.5 GiB on cuda2 (solo 262144 tokens + 2 slots x 262144 tokens + draft K/V 0.5 GiB)`. With elastic KV (the
-default for a server whose `--max-context` is above 32768) it reads `0.6 / 4.4 GiB on cuda0 (elastic)`: the memory backed at startup, and what the cache can
+On one card, a batch window's layer with enough CPU misses sends a share of them over PCIe: CUDA0 copies them from
+their RAM copies into VRAM staging and computes them while the CPU pool computes the rest, both reading RAM at once.
+The startup line `batch windows: a layer with N+ CPU misses sends a share of them over PCIe to CUDA0` gives the
+threshold. A request decoding alone runs the single-stream path and is not affected.
+
+At startup the server prints one `[server] kv` line per device with all the session state placed there, for
+example `12.5GiB cuda2 solo=262144 slots=2x262144 draft=0.5GiB`. With elastic KV (the
+default for a server whose `--max-context` is above 32768, or with `--parallel` for slots above 4096 tokens) it reads `0.6/4.4GiB cuda0 elastic`: the memory backed at startup, and what the cache can
 grow to at `--max-context`. Because that memory is
 taken from the expert cache, the engine warns (`warning: the N batch slots' sessions ... take X GiB of CUDA0
 ...`) when it leaves the cache short of the expert set, or at under half of what it would hold without the slots, and
@@ -58,8 +71,62 @@ the slots that did fit; if fewer than two fit, `--batch is off` and the server r
   `logit_bias`, a request with a grammar (JSON `response_format`, tools), control tokens and everything inside a tool call stay exact. A request can set
   its own value with `"relaxed_drafting": P` (or `false` for exact). Single-stream decoding only; `--parallel` slots
   stay exact.
-- The startup line `[server] engine: ...` lists the settings that came from the file or the command line, then the grammar state; with
-  none it says `using default flags` (with or without `--config`), e.g. `using default flags, grammar off (cli)`.
+- The startup line `[server] engine ...` lists the settings that came from the file or the command line, then the grammar state; with
+  none it says `defaults` (with or without `--config`), e.g. `grammar=off (from cli)`.
+
+## The console log
+
+Every server line starts with `[server]` and a label padded to a column; values are `key=value`. Rates are `t/s`,
+sizes `GiB`/`MiB`, times `s`. Startup prints one block, starting with a legend:
+
+```
+[server] legend   pp=prompt read  tg=generation  c=cached  acc=drafts accepted  dl=tokens per window  hit=expert cache  pcie=routed experts over PCIe
+[server] engine   ctx=262144 kv=int8 vram-reserve=500MiB pool=8 batch=4 (from config)
+[server] sampling temp=1.0 top_p=0.95 top_k=20 min_p=0.0 pres=0.0
+[server] vision   mode=dynamic gpu=0 (RTX 5090) load=per-image
+[server] auto     peer-excl=off resident=64.0GB pool-affinity=auto
+[server] loaded   68.4GiB 37.5s  cuda0=26.6GiB ram=41.2GiB cuda1=0.6GiB cuda1-copy=14.2GiB
+[server] kv       2.6/16.3GiB cuda0 elastic slots=4
+[server] slots    par=4 ctx/slot=262144 (slot-full-context), others queue
+[server] ready    http://127.0.0.1:8080/v1  openai+anthropic  ctx=262144 images=on
+[server] stats    http://127.0.0.1:8080/
+[server] network  http://192.168.2.205:8080/v1
+[server] warning  no api key, open to the network (--api-key KEY)
+```
+
+`sampling` marks a value set on the command line `(cli)` or in the config file `(config)`; `auto` is the engine's
+picked settings (see [configuration](configuration/index.md)). A warning or error that comes later reads
+`[server] warning: text` or `[server] error: text`.
+
+While a prompt is read, a slot prints `pp=<read>/<total>` with the read rate and the elapsed time about every 5 s:
+
+```
+[server] s2 read  pp=24576/66836 9150t/s 3s
+```
+
+While requests generate, one `live` line every 2 s covers every generating slot: `tg=<tokens>/<max> <rate>`.
+Slots are counted from 1, as on the stats page. `total` is the sum of the slots' rates. Acceptance is not shown
+live; the `done` line carries the engine's exact figures.
+
+```
+[server] live | s1 tg=454/2048 113.7t/s | s2 tg=436/2048 119.0t/s | total 233t/s
+```
+
+Each request ends with one slot-tagged `done` line:
+
+```
+[server] s1 done  pp=96/89c 0.1s  tg=1720 119.6t/s acc=65% dl=2.9  ttft=0.1s  end=stop  hit=89.7%  pcie=39.3%
+[server] s2 done  pp=66836/0c 7.3s 9204t/s  tg=512 281.0t/s acc=58% dl=2.7  ttft=7.3s  end=length
+```
+
+- `pp=<prompt tokens>/<cached>c <read time>`, with the read rate once at least 512 tokens were newly read; the rate
+  counts newly read tokens only.
+- `tg=<tokens> <rate>`. `acc` is drafts accepted over drafts offered for the request, `dl` the average tokens per
+  window; both are left out when the request did not draft.
+- `ttft` is the time to the first token; `end` is the finish reason (`stop`, `length`, `cancelled`, `disconnect`,
+  `error`).
+- `hit` is the expert cache hit rate and `pcie` the share of routed experts read over PCIe; both appear when the
+  engine reports them.
 
 ## Memory floors
 
@@ -81,33 +148,33 @@ Basalt refuses settings that would leave the machine without memory, and never s
   states the RAM free and the largest safe value ('max').
 - While serving, a request that finds MemAvailable below the margin plus 3.5 GiB (the margin alone when no expert is
   read from the SSD) stops with an error (`RAM low (... free < ... guard): request stopped`, also returned to the
-  client); the server keeps running and takes the next request.
+  client); the server keeps running and takes the next request. Windows does not count the pages read through the
+  mapped expert file as available, so within 1 GiB of the guard the engine gives them back first and reads again.
 
 ## Vision: `--vision`
 
-Image input is one server option, `--vision off | on | peer | dynamic | cpu` (config: `"vision": "peer"` in the
+Image input is one server option, `--vision off | dynamic | cpu | <GPU number>` (config: `"vision": 1` in the
 `server` section). It is `off` by default. The encoder is Basalt's own and shares its kernels in every mode, so all
-five give bitwise identical embeddings.
+of them give bitwise identical embeddings.
 
 | mode | where the encoder runs | VRAM cost | fresh-image latency (IQ3_S, 400 W, earlier build) |
 | --- | --- | --- | --- |
 | `off` | no image input | none | |
-| `on` | sidecar `bin/basalt-vision` on the main GPU, always loaded | about 2.2 GiB of the main card's expert cache | TTFT 0.77 s at 1k image tokens, 1.4 s at 3k, 1.8 s at 4k |
-| `peer` | the same sidecar on the second `--gpu` card | part of the peer card's cache, none on the main card | 0.86 s, 2.1 s, 2.9 s |
+| a GPU number | sidecar `bin/basalt-vision` on that card (the numbering `gpu` uses), always loaded | about 2.2 GiB of that card's expert cache | TTFT 0.77 s at 1k image tokens, 1.4 s at 3k, 1.8 s at 4k |
 | `dynamic` | inside the engine, on the main GPU | none at rest (0.85 GiB of pinned RAM) | 0.77 s, 1.45 s, 1.8 s |
 | `cpu` | sidecar on the CPU | none | about 6 s at 1k, 40 s at 3k, 70 s at 4k |
 
 `dynamic` borrows expert-cache slots per image (the prompt path's lend), uploads the weights from the
 pinned copy (about 30 ms), encodes on a side stream, and refills the same slots from RAM (about 70 ms), so the cache is
 identical afterwards. Other `--parallel` slots pause for the encode. An image already seen is served from the
-encoder cache in tens of milliseconds in every mode. `peer` on a single GPU warns and loads the encoder on that GPU;
-with two cards, `on` says so at startup and names `peer` as the way to put it on the second card.
+encoder cache in tens of milliseconds in every mode. The sidecar's card is named, not derived from `gpu`: any card
+works, whether or not it runs the engine, and the startup line names it.
 
 ```json
-{ "server": { "gpu": "0,1", "vision": "peer" } }
+{ "server": { "gpu": "0,1", "vision": 1 } }
 ```
 
-`on`, `peer` and `cpu` run the sidecar, which the main build also produces (`tools/vision` also builds on its
+A GPU number and `cpu` run the sidecar, which the main build also produces (`tools/vision` also builds on its
 own); the server looks for it next to `bin/basalt`, under its platform's program name. `dynamic` needs no sidecar.
 
 The image encoder is Basalt's own, written for this model's vision tower (no llama.cpp or ggml): bf16 tensor-core

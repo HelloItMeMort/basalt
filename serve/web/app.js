@@ -33,9 +33,50 @@ $$(".tabs .tab").forEach(t => t.onclick = () => view(t.dataset.view));
 
 /* ---- charts ---- */
 const CHARTS = [
-  { id: "decode", name: "Decode", steps: [50, 100, 200, 250, 300, 400, 500, 600, 700, 800, 1000, 1200, 1500, 2000], hover: null, v: Array(HIST).fill(0), max: 400 },
-  { id: "prefill", name: "Prefill", steps: [2000, 4000, 8000, 16000, 32000], hover: null, v: Array(HIST).fill(0), max: 8000 }];
+  { id: "decode", name: "Decode", short: "Decode", steps: [50, 100, 200, 250, 300, 400, 500, 600, 700, 800, 1000, 1200, 1500, 2000], hover: null, v: Array(HIST).fill(0), max: 400 },
+  { id: "prefill", name: "Prefill", short: "Prefill", steps: [2000, 4000, 8000, 16000, 32000], hover: null, v: Array(HIST).fill(0), max: 8000 }];
 const axis = n => n >= 1000 ? `${n / 1000}k` : String(n);
+// the fastest whole request this tab has seen (kept across reloads, cleared on a server restart or by Reset in its detail): a
+// request's own mean, not a burst, and only one big enough that fixed costs do not decide it
+const BEST_MIN_OUT = 256, BEST_MIN_READ = 4096;
+const ktok = n => n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}K` : String(n);
+const ktok3 = n => n >= 1000 ? `${(n / 1000).toFixed(n >= 100000 ? 0 : 1).replace(/\.0$/, "")}K` : String(n);
+let best = (() => { try { return JSON.parse(sessionStorage.getItem("basalt.best")) || {}; } catch (e) { return {}; } })();
+const saveBest = () => { try { sessionStorage.setItem("basalt.best", JSON.stringify(best)); } catch (e) { /* private mode */ } };
+function noteBest(reqs) {
+  const keep = (id, v, r, extra) => {
+    if (num(v) && v > 0 && !(best[id] && best[id].v >= v)) { best[id] = { v, t: r.time * 1000, id: r.id, ...extra }; saveBest(); }
+  };
+  for (const r of reqs) {
+    if (r.output_tokens >= BEST_MIN_OUT)
+      keep("decode", r.decode_tok_s, r, { out: r.output_tokens, ctx: (r.prompt_tokens || 0) + r.output_tokens,
+        acc: r.drafts_offered > 0 ? r.drafts_accepted / r.drafts_offered : null });
+    const read = (r.prompt_tokens || 0) - (r.reused || 0);
+    if (read >= BEST_MIN_READ && r.prompt_ms > 0) keep("prefill", read / (r.prompt_ms / 1000), r, { read });
+  }
+}
+let bestOpen = null;      // which best figure shows its detail
+function drawBest() {
+  $("#bests").hidden = !(best.decode || best.prefill);
+  if (!best[bestOpen]) bestOpen = null;
+  for (const id of ["decode", "prefill"]) {
+    const b = best[id], el = $("#pk-" + id), html = b ? `${fmt(b.v, id === "decode" ? 1 : 0)}<small>tok/s</small>` : "—";
+    el.setAttribute("aria-expanded", String(bestOpen === id));
+    const v = el.querySelector("b");
+    if (v.innerHTML !== html) v.innerHTML = html;
+  }
+  const b = best[bestOpen];
+  $("#best-detail").hidden = !b;
+  if (!b) return;
+  text("#bd-text", bestOpen === "decode"
+    ? `${fmt(b.out)} tok · ${num(b.acc) ? `${Math.round(b.acc * 100)}% accept · ` : ""}${ktok(b.ctx)} ctx`
+    : `${ktok(b.read)} read`);
+  $("#bd-text").title = `Fastest whole request this session (${b.id}, ${clock(b.t).slice(0, 8)}): `
+    + (bestOpen === "decode" ? `at least ${BEST_MIN_OUT} output tokens` : `at least ${fmt(BEST_MIN_READ)} newly read prompt tokens`)
+    + ". Kept in this tab until the server restarts.";
+}
+["decode", "prefill"].forEach(id => $("#pk-" + id).onclick = () => { bestOpen = bestOpen === id ? null : id; drawBest(); });
+$("#bd-reset").onclick = () => { delete best[bestOpen]; bestOpen = null; saveBest(); drawBest(); };
 const tail = a => { const v = (a || []).slice(-HIST).map(x => num(x) ? x : 0); while (v.length < HIST) v.unshift(0); return v; };
 
 function drawChart(c, now, last, lastNote) {
@@ -54,7 +95,9 @@ function drawChart(c, now, last, lastNote) {
   [cur, dot, tip].forEach(e => e.hidden = h == null);
   if (h == null) {
     const live = num(now) && now > 0, shown = live ? now : last;
-    label.textContent = `${c.name}, ${live ? "now" : `last request${lastNote ? ` · ${lastNote}` : ""}`}`;
+    // short text for a phone; the full wording is the tooltip
+    label.textContent = live ? `${c.short} · now` : `${c.short}${lastNote ? ` · ${ktok3(lastNote)} tok` : ""}`;
+    label.title = `${c.name}, ${live ? "now" : `last request${lastNote ? ` · ${fmt(lastNote)} tokens` : ""}`}`;
     read.innerHTML = num(shown) ? `${fmt(shown, c.id === "decode" ? 1 : 0)}${unit}` : "—";
     return;
   }
@@ -65,7 +108,8 @@ function drawChart(c, now, last, lastNote) {
   tip.style.left = x + "%"; tip.style.top = clamp(y, 16, 84) + "%";
   tip.classList.toggle("flip", h > 34);
   tip.innerHTML = `<b>${val}</b><span>${when}</span>`;
-  label.textContent = `${c.name}, ${when.toLowerCase()}`;
+  label.textContent = `${c.short} · ${when.toLowerCase()}`;
+  label.title = `${c.name}, ${when.toLowerCase()}`;
   read.innerHTML = v > 0 ? `${fmt(v, c.id === "decode" ? 1 : 0)}${unit}` : "Idle";
 }
 CHARTS.forEach(c => {
@@ -122,7 +166,8 @@ function draw() {
   const lastPrefill = r0 && r0.prompt_ms > 0 && r0.prompt_tokens > (r0.reused || 0) ? (r0.prompt_tokens - (r0.reused || 0)) / (r0.prompt_ms / 1000) : null;
   drawChart(CHARTS[0], generating ? live.tok_s : null, last);
   const lastRead = r0 ? (r0.prompt_tokens || 0) - (r0.reused || 0) : 0;   // short prompts are dominated by fixed cost, so show the size
-  drawChart(CHARTS[1], live.state === "reading" ? live.prefill_tok_s_mean : null, lastPrefill, lastPrefill != null ? `${fmt(lastRead)} tokens` : "");
+  drawChart(CHARTS[1], live.state === "reading" ? live.prefill_tok_s_mean : null, lastPrefill, lastPrefill != null ? lastRead : 0);
+  noteBest(reqs); drawBest();
 
   text("#s-load", num(g0.util) ? `${Math.round(g0.util)}%` : "—");
   text("#s-vram", num(g0.mem_used) ? `${gib(g0.mem_used)} / ${gib(g0.mem_total)} GiB` : "—");
@@ -302,7 +347,7 @@ function drawSlots(M, multi) {
     host.replaceChildren(head, ...sl.map(s => {
       const d = document.createElement("div"); d.className = "lane"; d.dataset.s = "idle";
       const ctxc = cell("l-ctx"), meter = cell("meter"); meter.append(document.createElement("i")); ctxc.append(meter, cell(""));
-      d.append(cell("l-id", `Slot ${s.id}`), cell("l-st"), cell("l-tps"), cell("l-tok"), ctxc, cell("l-acc"), cell("l-req"));
+      d.append(cell("l-id", `Slot ${s.id + 1}`), cell("l-st"), cell("l-tps"), cell("l-tok"), ctxc, cell("l-acc"), cell("l-req"));
       return d;
     }));
   }
@@ -363,7 +408,7 @@ async function pollMetrics() {
 async function pollLog() {
   try {
     const r = await get(`api/logs?after=${lastLog}`);
-    if (r.last < lastLog) { logs.length = 0; lastLog = 0; rebuild(); }       // the server restarted
+    if (r.last < lastLog) { logs.length = 0; lastLog = 0; best = {}; saveBest(); rebuild(); }       // the server restarted
     else if (r.lines.length) { lastLog = r.last; append(r.lines); }
     else if (!logs.length && !logEl.firstChild) rebuild();
   } catch (e) { /* the metrics poll reports the connection */ }

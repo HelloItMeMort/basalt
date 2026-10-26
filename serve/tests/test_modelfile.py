@@ -211,7 +211,7 @@ class Cli(Tmp):
 
     def test_vision_numbered_card_is_checked_at_startup(self):
         path = self.build(vision=True)
-        (self.engine_bin.parent / "basalt-vision").write_text("")
+        (self.engine_bin.parent / modelfile.VISION_EXE).write_text("")
         base = ["--model", path, "--engine-bin", str(self.engine_bin), "--gpu", "0"]
 
         def plan(engine_bin, value):                     # a fake --gpu-plan: card 0 Blackwell, card 9 refused

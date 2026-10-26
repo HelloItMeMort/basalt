@@ -360,11 +360,10 @@ def build_parser() -> argparse.ArgumentParser:
                          "without the dashes, e.g. \"engine\": {\"max-context\": 32768, \"spec\": 7, "
                          "\"resident-experts\": true}; a list gives a flag several values; the command line "
                          "wins over it")
-    ap.add_argument("--vision", nargs="?", const="", default="off", type=vision_setting, choices=VISION_MODES, metavar="MODE",
-                    help="image input: off (default), on (the encoder always on the main GPU, ~2.2 GiB of VRAM), "
-                         "peer (always on the second GPU), dynamic (inside the engine: it borrows expert-cache slots "
-                         "on the main GPU while it reads an image, no standing VRAM) or cpu (no VRAM, slow); a value is "
-                         "required")
+    ap.add_argument("--vision", nargs="?", const="", default="off", type=vision_setting, metavar="MODE|GPU",
+                    help="image input: off (default), dynamic (inside the engine: it borrows expert-cache slots "
+                         "on the main GPU while it reads an image, no standing VRAM), cpu (no VRAM, slow) or a "
+                         "GPU number, as nvidia-smi numbers them: the encoder sidecar, always on that card")
     ap.add_argument("--host", action="append", default=[], metavar="ADDRESS",
                     help="the address to listen on, given once per address (default: 127.0.0.1 = this PC only), "
                          "e.g. --host 127.0.0.1 --host 192.168.1.20; 0.0.0.0 = every interface (give --api-key)")

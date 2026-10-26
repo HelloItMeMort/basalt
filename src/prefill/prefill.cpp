@@ -63,7 +63,13 @@ constexpr int64_t N = 2560, HC = 4, D = N * HC, LR = 320, K = 10, NE = 512;
 constexpr int64_t C = 10240, ZV = 6144, HV = 48;
 // staging holds the largest blob of the pack (a native pack's blobs differ per layer)
 inline int64_t MAXBLOB() { return (int64_t) basalt::kernels::cpu::expert_layout().max_blob; }
-constexpr int STAGE = 8;           // host->device expert staging ring (chunks below stream_all_min())
+// host->device expert staging ring of a chunk below stream_all_min(): two groups of MMQ_GROUP experts, so a slot is
+// copied into again only once the group that read it has run
+constexpr int STAGE = 32;
+// Such a chunk also holds, per layer parity, slots for the next layer's experts copied ahead of its routing, after the
+// STAGE slots: about as many as the link moves while a layer's attention half runs, which grows with the chunk.
+constexpr int kAheadSlots = 64;
+inline int ahead_slots(size_t T) { return (int) std::min<size_t>(kAheadSlots, T / 32); }
 // From the chunk size stream_all_min() on, every non-resident expert of every layer streams in a fixed order through a
 // ring_slots()-slot ring (nearly every expert is routed at such a chunk), so the copy engine keeps working through the
 // attention halves instead of waiting for each layer's routing.
@@ -84,7 +90,6 @@ int g_ring_depth = kPrefillRingDeep;
 // Whether the fused experts' buffers apply: a streamed chunk of a pack the fused kernels cover.
 inline bool fused_ring() {
     if (!fused::enabled()) return false;
-    if (core::prompt_peer()) return false;   // multi-GPU: a prompt peer keeps the MMQ path and its buffer sizes
     const basalt::kernels::cpu::ExpertLayout& lay = basalt::kernels::cpu::expert_layout();
     if (!lay.native) return true;
     // EVERY layer: fused_layout() shrinks the MoE buffers to the fused path's needs, so a layer the native kernels do
@@ -99,8 +104,8 @@ inline bool fused_ring() {
 }
 // (a prompt peer's streamed share and the fused kernels' batches follow the ring's size: those keep 256)
 inline int ring_slots(size_t T) {
-    if ((int64_t) T < stream_all_min()) return STAGE;
-    const bool deep = (int64_t) T >= kDeepRingTokens && !core::prompt_peer() && !fused_ring();
+    if ((int64_t) T < stream_all_min()) return std::min(g_ring_depth, STAGE + 2 * ahead_slots(T));
+    const bool deep = (int64_t) T >= kDeepRingTokens && !fused_ring();
     return std::min(g_ring_depth, deep ? kPrefillRingDeep : kPrefillRing);
 }
 constexpr int DQ = 2;              // dequantized-expert ring (FP16 gate/up + down)
@@ -305,7 +310,7 @@ static Stager::Job make_job(core::ExpertSource& src, int64_t l, int32_t e, const
 }
 
 // multi-GPU: the peer GPU's share of a prompt chunk's experts.  Per MoE layer the primary copies its normed
-// activations over P2P, the peer quantizes the rows routed to the experts it holds, runs the same MMQ products the
+// activations through host memory, the peer quantizes the rows routed to the experts it holds, runs the same MMQ products the
 // primary would (gathered from its own slots), and copies the result rows back into the primary's Dm rows - the rows
 // are laid out local-first, so the peer's are one contiguous block at the end.
 struct PeerPrefill {
@@ -328,20 +333,6 @@ struct PeerPrefill {
     cudaEvent_t ev_dm[2] = {};
     bool dm_live[2] = {};
     std::vector<std::pair<size_t, size_t>> groups;
-    // PEER STREAMING: a share of the experts the primary would stream over ITS PCIe link in a
-    // big chunk is streamed by the peer over its own link instead (into its own ring) and computed there - it halves
-    // the primary's copy load and moves expert work to the card that idles through most of the MoE half.
-    double ps_frac = 0.0;
-    int RP = 0;
-    std::vector<uint8_t*> pstage;
-    std::vector<cudaEvent_t> pcopied, pused;
-    std::vector<char> plive;
-    cudaStream_t s_cp = nullptr;
-    struct PsEntry { int32_t l, e; const uint8_t* blob; };
-    std::vector<PsEntry> pseq;            // this chunk's peer-streamed experts, layer by layer in id order
-    std::vector<size_t> pseq_start;
-    std::vector<char> ps_flag;            // [layer * NE + e]: streamed by the peer in this chunk
-    size_t p_issued = 0, pk = 0;
     float* mixed = nullptr;
     int32_t *src = nullptr, *bounds = nullptr, *ident = nullptr;
     uint8_t *grp_gu = nullptr, *grp_d = nullptr;
@@ -389,10 +380,6 @@ struct PeerPrefill {
         for (cudaEvent_t e : ev_dm) if (e) cudaEventDestroy(e);
         if (ev_hx_free) cudaEventDestroy(ev_hx_free);
         for (cudaEvent_t e : ev_d2h) if (e) cudaEventDestroy(e);
-        if (s_cp) cudaStreamSynchronize(s_cp);
-        for (cudaEvent_t e : pcopied) if (e) cudaEventDestroy(e);
-        for (cudaEvent_t e : pused) if (e) cudaEventDestroy(e);
-        if (s_cp) cudaStreamDestroy(s_cp);
         if (s_out) cudaStreamDestroy(s_out);
         if (s) cudaStreamDestroy(s);
         cudaSetDevice(prim >= 0 ? prim : prev);
@@ -549,6 +536,16 @@ struct Prefill::Impl {
     // the event that releases each ring slot: its own `used`, or - when an MMQ group is gathered in one launch - the
     // `used` of the last slot gathered with it, recorded once for all of them (a later record only waits longer)
     int used_of[RING_MAX] = {};
+    // A chunk below stream_all_min(): the next layer's routing guessed from this layer's FFN rows (the next layer's router
+    // on them; on the device and in mapped host memory), the rows it gives each expert, and per layer parity the
+    // layer whose experts were copied ahead and each one's ring slot (-1: not copied ahead).
+    int32_t *guess_ids = nullptr, *guess_host = nullptr, *guess_host_dev = nullptr;
+    float* guess_w = nullptr;
+    int64_t guess_cap = 0, guess_layer = -1;
+    std::vector<int32_t> guess_rows;
+    std::vector<int32_t> ahead_slot[2];
+    int64_t ahead_layer[2] = {-1, -1};
+    cudaEvent_t ahead_ev = nullptr;          // where on the compute stream the copies ahead may start
     // PLE
     float* ple_emb = nullptr;
     std::vector<float> ple_pageable[2];      // the fallback when no more RAM can be pinned
@@ -565,11 +562,17 @@ struct Prefill::Impl {
     // layer split: the device, and the hand-off to the next stage (two pinned chunk buffers, used in turn)
     int device = -1;
     float* hand[2] = {};
+    int64_t hand_rows = 0;                   // the rows each hand-off buffer holds
     // the chunk's token ids on the device, for one batched embedding gather
     int32_t* tok_dev = nullptr;
     std::vector<int32_t> tok_host;
     std::unique_ptr<PeerPrefill> pp;         // multi-GPU: the peer GPU's expert share (set_peer)
+    bool peer_share = true;                  // set_peer_share
     core::PeerExperts* ring_peer = nullptr;  // --peer-exclusive: experts held only there are copied from its memory
+    // set_ring_remote: another card's cache, read for the experts without a pinned host copy
+    const int32_t* remote_res = nullptr;
+    const core::ExpertCache* remote_cache = nullptr;
+    int remote_dev = -1;
     PeerStage peer_stage;                    // the asynchronous host-staged copy of those experts
     // row-cache warm-up of the prompt's later parts (set_ple_warm)
     struct PleWarm {
@@ -637,8 +640,9 @@ void Prefill::release() {
     for (float* p : {impl_->cpu_x, impl_->cpu_rows})
         if (p) cudaFreeHost(p);
     if (impl_->cpu_s) cudaStreamDestroy(impl_->cpu_s);
-    for (cudaEvent_t e : {impl_->cpu_ev_in, impl_->cpu_ev_x, impl_->cpu_gev[0], impl_->cpu_gev[1]})
+    for (cudaEvent_t e : {impl_->cpu_ev_in, impl_->cpu_ev_x, impl_->cpu_gev[0], impl_->cpu_gev[1], impl_->ahead_ev})
         if (e) cudaEventDestroy(e);
+    if (impl_->guess_host) cudaFreeHost(impl_->guess_host);
     for (void* p : impl_->owned) cudaFree(p);
 }
 
@@ -680,6 +684,7 @@ uint64_t qsa_set_bytes(size_t T, int64_t cap, int64_t max_blocks, int64_t sel_ba
 // is converted to GGUF Q2_0 blocks on the gather), whether any layer keeps the FP16 path (IQ1_M), and the largest
 // gate/up and down matrices a group buffer slot holds.
 constexpr int MMQ_GROUP = 16;                  // experts per MMQ launch (the gather is per expert, as blobs arrive)
+static_assert(STAGE >= 2 * MMQ_GROUP, "the staging ring holds two groups");
 // MMQ reads up to one 256-value tile past a matrix's last row when the row length is not a multiple of it (the down
 // product: 640 values).  Those bytes meet zero activations, which is harmless only if they decode to finite numbers -
 // llama.cpp zero-pads after every tensor, and so does a group buffer: this many zeroed bytes follow its last expert.
@@ -748,11 +753,13 @@ bool fp4_pack() {
 }
 // A chunk shorter than this leaves most expert tiles nearly empty and the per-expert launches dominate: MMQ is faster.
 constexpr int64_t FP4_MIN_TOKENS = 1024;
-// Without direct access between the cards, the peer computes its experts' rows of a streamed chunk of up to this many
+// The peer computes its experts' rows of a streamed chunk of up to this many
 // tokens (PeerPrefill::T_fp4).  The layer's activations go to it and its rows come back through host memory, and the
 // layer's end waits for that round trip; it grows with the chunk while the blobs it saves do not, so a longer chunk
 // streams the blobs instead.
 constexpr int64_t kPeerFp4Tokens = 5120;
+// A peer card slower than the main one takes the rows of routed-only chunks up to this size, no more.
+constexpr int64_t kPeerSlowRows = 2559;
 // In such a chunk the issuing thread keeps at most this many expert copies queued on the primary's link (the ring still
 // runs as far ahead): copies on one link are served in the order they were queued, and the peer's result rows, which
 // the layer's end waits for, would otherwise queue behind the copies for the layers after it.
@@ -864,6 +871,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
             err = "prefill: the layer split's hand-off buffers";
             return false;
         }
+    if (next_ != nullptr) m.hand_rows = std::max(m.hand_rows, chunk);
     if (m.tok_dev == nullptr) {
         if (const cudaError_t e = cudaMalloc((void**) &m.tok_dev, (size_t) chunk * sizeof(int32_t)); e != cudaSuccess) {
             err = std::string("prefill: the token id buffer (") + cudaGetErrorString(e) + ")";
@@ -909,7 +917,8 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
             }
         }
     }
-    for (int b = 0; b < 2; ++b) {
+    // the PLE rows' host buffers, for a stage that runs layer 1
+    for (int b = 0; stage_lb_ <= 1 && 1 < stage_le_ && b < 2; ++b) {
         if (!m.ple_emb_host[b] &&
             cudaHostAlloc((void**) &m.ple_emb_host[b], (size_t) T * N * 4, cudaHostAllocDefault) != cudaSuccess) {
             cudaGetLastError();
@@ -919,6 +928,24 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         if (!m.ple_copied[b] && cudaEventCreateWithFlags(&m.ple_copied[b], cudaEventDisableTiming) != cudaSuccess)
             ok = false;
         m.ple_rows[b].resize(T * basalt::kernels::PLE_N_HEADS);
+    }
+    if (m.guess_host == nullptr) {   // the routing guess of a chunk below stream_all_min(), outside the loan
+        const int64_t rows = std::min<int64_t>(chunk, stream_all_min() - 1) * K;
+        void* hd = nullptr;
+        bool got = rows > 0 && cudaMalloc((void**) &m.guess_ids, (size_t) rows * 4) == cudaSuccess;
+        if (got) m.owned.push_back(m.guess_ids);
+        got = got && cudaMalloc((void**) &m.guess_w, (size_t) rows * 4) == cudaSuccess;
+        if (got) m.owned.push_back(m.guess_w);
+        got = got && cudaHostAlloc((void**) &m.guess_host, (size_t) rows * 4,
+                                   cudaHostAllocMapped | (core::peer_portable() ? cudaHostAllocPortable : 0)) == cudaSuccess &&
+              cudaHostGetDevicePointer(&hd, m.guess_host, 0) == cudaSuccess;
+        if (got) {
+            m.guess_host_dev = (int32_t*) hd;
+            m.guess_cap = rows;
+        } else {
+            cudaGetLastError();   // no guess: no copies ahead
+        }
+        for (int b = 0; b < 2; ++b) m.ahead_slot[b].assign((size_t) m.g->n_expert, -1);
     }
     if (ss.qsa_states[ss.qsa_primary()].kv_mode == 1) {   // KV streaming: the staging pool's identity page table
         const int64_t pages = ss.qsa_states[ss.qsa_primary()].n_pages;
@@ -1182,7 +1209,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
         rms_rows(emb, w_ne, nb, Nn, Nn, EPS, m.cs);
         if (!q8) to_f16(emb, en16, nb * Nn, m.cs);
         proj(emb, en16, w_fe, e2, nb, Nn, Nn, 0);
-        cudaMemcpyAsync(hn, R_rows + (size_t) b0 * HCN, (size_t) nb * HCN * 4, cudaMemcpyDeviceToDevice, m.cs);
+        cudaMemcpyAsync(hn, R_rows + (size_t) b0 * HCN, (size_t) nb * HCN * 4, cudaMemcpyDefault, m.cs);   // (or pinned host rows)
         rms_rows(hn, w_nh, nb, HCN, HCN, EPS, m.cs);
         if (!q8) to_f16(hn, hn16, nb * HCN, m.cs);
         proj(hn, hn16, w_fh, h2, nb * g.hc, Nn, Nn, 1);   // every stream through fc_hidden
@@ -1220,12 +1247,64 @@ void Prefill::set_ring_peer(core::PeerExperts* peer) {
     impl_->ring_peer = peer != nullptr && peer->valid() ? peer : nullptr;
 }
 
+void Prefill::set_ring_remote(const int32_t* res, const core::ExpertCache* cache, int device) {
+    const bool on = res != nullptr && cache != nullptr && device >= 0;
+    impl_->remote_res = on ? res : nullptr;
+    impl_->remote_cache = on ? cache : nullptr;
+    impl_->remote_dev = on ? device : -1;
+}
+
+void Prefill::set_peer_share(bool on) { impl_->peer_share = on; }
+
+void Prefill::set_stage(int64_t layer_begin, int64_t layer_end, Prefill* next) {
+    if (layer_end < 0 && impl_->g != nullptr) layer_end = impl_->g->n_layers;   // after init: resolved here
+    stage_lb_ = layer_begin;
+    stage_le_ = layer_end;
+    next_ = next;
+    if (layer_begin == 0) {   // the first stage reads its tokens, not rows a stage before it left
+        hand_in_ = nullptr;
+        rows_in_place_ = false;
+    }
+}
+
 // The peer's prompt share for chunks of up to `T_max` tokens (set_peer); `tf`: PeerPrefill::T_fp4, 0 for none.
+// The peer card's prompt buffers for chunks of up to `Tp` tokens (`tf` > 0: with the FP4 share's), each from `take(bytes)`,
+// in one place so that the tier's reserve and the allocation count the same bytes.
+template <class Take>
+static void peer_layout(PeerPrefill& pp, int64_t Tp, int64_t tf, const MmqPlan& mp, Take&& take) {
+    pp.mixed = (float*) take((size_t) Tp * N * 4);
+    pp.cap_rows = Tp * K;         // no row cap: only the row tables grow with it
+    pp.G = pp.T_max;              // one expert never has more rows than the chunk has tokens
+    const int64_t Gr = pp.G;
+    pp.Xq_g = take(mmq::q8_bytes(Gr, N));
+    pp.Hq_g = take(mmq::q8_bytes(Gr, 640));
+    pp.GU_g = (float*) take((size_t) Gr * 1280 * 4);
+    pp.H_g = (float*) take((size_t) Gr * 640 * 4);
+    pp.Dm_b[0] = (float*) take((size_t) Gr * N * 4);
+    pp.Dm_b[1] = (float*) take((size_t) Gr * N * 4);
+    const int64_t Rt = pp.cap_rows;
+    pp.src = (int32_t*) take((size_t) Rt * 4);
+    pp.ident = (int32_t*) take((size_t) Rt * 4);
+    pp.bounds = (int32_t*) take((size_t) (2 * (NE + NE / MMQ_GROUP + 2)) * 4);
+    pp.grp_gu = (uint8_t*) take(MMQ_GROUP * mp.gu_max + MMQ_TAIL);
+    pp.grp_d = (uint8_t*) take(MMQ_GROUP * mp.d_max + MMQ_TAIL + MMQ_SCALES);
+    if (tf > 0) {   // the FP4 share's group buffers (GU, H and the result rows are the MMQ group's)
+        pp.f_a4x = take(fp4::token_bytes(Tp, N));
+        pp.f_gsx = (float*) take((size_t) Tp * 4);
+        pp.f_a4h = take(fp4::a4_bytes(Gr, 640, MMQ_GROUP));
+        pp.f_gsh = (float*) take(fp4::scale_count(Gr, MMQ_GROUP) * 4);
+        pp.f_toh = (int32_t*) take((size_t) 2 * (MMQ_GROUP + 1) * 4);
+        // a piece per expert and one per whole tile run cut off a long one, and per group one bound more
+        pp.f_rel_cap = (size_t) 2 * (NE + Tp * K / fp4::kTileTokens + 1);
+        pp.f_rel = (int32_t*) take(pp.f_rel_cap * 4);
+    }
+}
+
 static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t cap_rows, int64_t tf,
                       std::unique_ptr<PeerPrefill>& out, std::string& err) {
     auto pp = std::make_unique<PeerPrefill>();
     pp->peer = peer;
-    pp->T_max = peer->p2p() ? T_max : std::min<int64_t>(T_max, stream_all_min() - 1);
+    pp->T_max = std::min<int64_t>(T_max, stream_all_min() - 1);
     pp->T_fp4 = tf;
     const int64_t Tp = std::max(pp->T_max, tf);   // the longest chunk the peer takes
     pp->cap_rows = std::max<int64_t>(1, std::min<int64_t>(cap_rows, Tp * K));
@@ -1258,51 +1337,9 @@ static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t cap_rows, 
         pp->owned.push_back(p);
         return p;
     };
-    pp->mixed = (float*) take((size_t) Tp * N * 4);
-    {
-        pp->cap_rows = Tp * K;          // no row cap: only the row tables grow with it
-        pp->G = pp->T_max;              // one expert never has more rows than the chunk has tokens
-        const int64_t Gr = pp->G;
-        pp->Xq_g = take(mmq::q8_bytes(Gr, N));
-        pp->Hq_g = take(mmq::q8_bytes(Gr, 640));
-        pp->GU_g = (float*) take((size_t) Gr * 1280 * 4);
-        pp->H_g = (float*) take((size_t) Gr * 640 * 4);
-        pp->Dm_b[0] = (float*) take((size_t) Gr * N * 4);
-        pp->Dm_b[1] = (float*) take((size_t) Gr * N * 4);
-        for (int b = 0; b < 2 && ok; ++b) ok = cudaEventCreateWithFlags(&pp->ev_dm[b], cudaEventDisableTiming) == cudaSuccess;
-        pp->ps_frac = 0.35;   // the share of the primary's streamed experts the peer streams
-        if (!mp.fallback && peer->p2p() && pp->T_max >= stream_all_min()) {
-            pp->RP = 48;
-            pp->pstage.assign((size_t) pp->RP, nullptr);
-            pp->pcopied.assign((size_t) pp->RP, nullptr);
-            pp->pused.assign((size_t) pp->RP, nullptr);
-            pp->plive.assign((size_t) pp->RP, 0);
-            ok = ok && cudaStreamCreateWithFlags(&pp->s_cp, cudaStreamNonBlocking) == cudaSuccess;
-            for (int i = 0; ok && i < pp->RP; ++i) {
-                pp->pstage[(size_t) i] = (uint8_t*) take((size_t) MAXBLOB());
-                ok = ok && cudaEventCreateWithFlags(&pp->pcopied[(size_t) i], cudaEventDisableTiming) == cudaSuccess &&
-                     cudaEventCreateWithFlags(&pp->pused[(size_t) i], cudaEventDisableTiming) == cudaSuccess;
-            }
-        } else {
-            pp->ps_frac = 0.0;
-        }
-    }
-    const int64_t Rt = pp->cap_rows;
-    pp->src = (int32_t*) take((size_t) Rt * 4);
-    pp->ident = (int32_t*) take((size_t) Rt * 4);
-    pp->bounds = (int32_t*) take((size_t) (2 * (NE + NE / MMQ_GROUP + 2)) * 4);
-    pp->grp_gu = (uint8_t*) take(MMQ_GROUP * mp.gu_max + MMQ_TAIL);
-    pp->grp_d = (uint8_t*) take(MMQ_GROUP * mp.d_max + MMQ_TAIL + MMQ_SCALES);
-    if (tf > 0) {   // the FP4 share's group buffers (GU, H and the result rows are the MMQ group's)
-        const int64_t Gr = pp->G;
-        pp->f_a4x = take(fp4::token_bytes(Tp, N));
-        pp->f_gsx = (float*) take((size_t) Tp * 4);
-        pp->f_a4h = take(fp4::a4_bytes(Gr, 640, MMQ_GROUP));
-        pp->f_gsh = (float*) take(fp4::scale_count(Gr, MMQ_GROUP) * 4);
-        pp->f_toh = (int32_t*) take((size_t) 2 * (MMQ_GROUP + 1) * 4);
-        // a piece per expert and one per whole tile run cut off a long one, and per group one bound more
-        pp->f_rel_cap = (size_t) 2 * (NE + Tp * K / fp4::kTileTokens + 1);
-        pp->f_rel = (int32_t*) take(pp->f_rel_cap * 4);
+    peer_layout(*pp, Tp, tf, mp, take);
+    for (int b = 0; b < 2 && ok; ++b) ok = cudaEventCreateWithFlags(&pp->ev_dm[b], cudaEventDisableTiming) == cudaSuccess;
+    if (tf > 0) {
         ok = ok && cudaEventCreateWithFlags(&pp->ev_hx_free, cudaEventDisableTiming) == cudaSuccess;
         for (int b = 0; ok && b < PeerPrefill::kRes; ++b)
             ok = cudaEventCreateWithFlags(&pp->ev_d2h[b], cudaEventDisableTiming) == cudaSuccess;
@@ -1328,30 +1365,42 @@ static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t cap_rows, 
     }
     basalt::log::info("basalt prefill", "peer GPU %d computes its experts' rows of each prompt chunk%s, with compact group "
                          "buffers%s; %zu MiB left free on it", pp->dev,
-                 peer->p2p() ? "" : (" up to " + std::to_string(Tp) + " tokens" +
-                                     (tf > 0 ? " (a streamed one with the primary's FP4 kernels)" : "")).c_str(),
-                 pp->ps_frac > 0.0 ? (", streaming " + std::to_string((int) (pp->ps_frac * 100 + 0.5)) +
-                                      "% of the primary's streamed experts through a " + std::to_string(pp->RP) + "-slot ring").c_str()
-                                   : "", fb >> 20);
+                 (" up to " + std::to_string(Tp) + " tokens" +
+                  (tf > 0 ? " (a streamed one with the primary's FP4 kernels)" : "")).c_str(),
+                 "", fb >> 20);
     out = std::move(pp);
     return true;
 }
 
-bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& err) {
+uint64_t Prefill::peer_bytes(int64_t chunk, bool streamed_share) {
+    if (!mmq_plan().any) return 0;
+    PeerPrefill pp;
+    pp.T_max = std::min<int64_t>(chunk, streamed_share ? stream_all_min() - 1 : kPeerSlowRows);
+    const int64_t t_fp4 = !streamed_share || !fp4_every_layer() || fused_ring() || stream_all_min() < FP4_MIN_TOKENS
+                              ? 0 : std::min<int64_t>(chunk, kPeerFp4Tokens);
+    const int64_t tf = t_fp4 >= stream_all_min() ? t_fp4 : 0;
+    const int64_t Tp = std::max(pp.T_max, tf);
+    uint64_t sum = 0;
+    peer_layout(pp, Tp, tf, mmq_plan(), [&](size_t bytes) -> void* { sum += (bytes + 255) & ~size_t(255); return nullptr; });
+    return sum;
+}
+
+bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, bool streamed_share, std::string& err) {
     Impl& m = *impl_;
     if (peer == nullptr || !peer->valid()) { m.pp.reset(); return true; }
-    // Without P2P the peer still takes the rows of the routed-only chunks (below stream_all_min()): the activations and
+    // The peer takes the rows of the routed-only chunks (below stream_all_min()): the activations and
     // result rows cross through host staging (cudaMemcpyPeerAsync) and the streamed ring stays off.  It also takes
     // those of a streamed chunk of up to kPeerFp4Tokens (PeerPrefill::T_fp4) where those buffers fit too.
     if (!mmq_plan().any) { err = "prefill peer: needs the MMQ prompt path"; return false; }
-    const int64_t t_fp4 = peer->p2p() || !fp4_every_layer() || fused_ring() || stream_all_min() < FP4_MIN_TOKENS
+    const int64_t t_fp4 = !streamed_share || !fp4_every_layer() || fused_ring() || stream_all_min() < FP4_MIN_TOKENS
                               ? 0 : std::min<int64_t>(m.T_max, kPeerFp4Tokens);
     std::unique_ptr<PeerPrefill> pp;
-    bool ok = make_peer(peer, m.T_max, cap_rows, t_fp4 >= stream_all_min() ? t_fp4 : 0, pp, err);
+    const int64_t t_routed = streamed_share ? m.T_max : std::min<int64_t>(m.T_max, kPeerSlowRows);
+    bool ok = make_peer(peer, t_routed, cap_rows, t_fp4 >= stream_all_min() ? t_fp4 : 0, pp, err);
     if (!ok && t_fp4 >= stream_all_min()) {   // the routed-only chunks alone
         pp.reset();
         err.clear();
-        ok = make_peer(peer, m.T_max, cap_rows, 0, pp, err);
+        ok = make_peer(peer, t_routed, cap_rows, 0, pp, err);
     }
     if (!ok) return false;
     m.pp = std::move(pp);
@@ -1368,6 +1417,7 @@ void Prefill::set_cpu_share(double share) { impl_->cpu_share_now = std::max(0.0,
 void Prefill::set_ring_depth(int slots) { g_ring_depth = std::max(STAGE + 1, std::min(slots, kPrefillRingDeep)); }
 int Prefill::ring_depth() const { return impl_->ring; }
 double Prefill::pinned_share() { return g_pinned_share; }
+bool Prefill::fp4_experts() { return fp4_pack(); }
 
 namespace { constexpr uint64_t kSizingSlack = 8u << 20; }   // alignment slack of a borrowed region
 
@@ -1457,11 +1507,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     err.clear();
     Impl& m = *impl_;
     const core::OnDevice on_device(m.device);
-    if (m.hist_on) m.hist_tokens += n;
     const core::ModelGeometry& g = *m.g;
     core::SessionState& ss = *m.ss;
     const auto t_start = Clock::now();
     const int64_t LB = stage_lb_, LE = stage_le_;
+    // set_ring_remote: an expert with no pinned host copy that the other card's cache holds (its blob there), or null
+    auto remote_blob = [&m](int64_t l, int32_t e) -> const uint8_t* {
+        if (m.remote_res == nullptr || m.src == nullptr || m.src->pinned(l, e)) return nullptr;
+        const int32_t s = m.remote_res[(size_t) l * m.g->n_expert + e];
+        return s >= 0 ? m.remote_cache->device_slot(s) : nullptr;
+    };
+    // the card the ring's other-card copies come from (--peer-exclusive's peer, or set_ring_remote's card)
+    const int remote_device = m.ring_peer ? m.ring_peer->device() : m.remote_dev;
     // The direct successor's future lives on the Prefill object. Intermediate
     // stages therefore do not drain the complete remaining GPU chain here.
     basalt::kernels::QsaShapes s = basalt::kernels::qsa_real_shapes();
@@ -1470,9 +1527,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
                                 (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
     int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
-    const bool single_chunk = hand_in_ == nullptr ? n <= m.T : single_chunk_;
+    // the first stage embeds the tokens; a later one reads the previous stage's rows (handed on, or in its own buffers)
+    const bool rows_in_place = rows_in_place_;
+    rows_in_place_ = false;
+    if (m.hist_on && !rows_in_place) m.hist_tokens += n;   // a kept chunk's tokens counted in the run that kept it
+    const bool first_stage = hand_in_ == nullptr && !rows_in_place;
+    const bool single_chunk = first_stage ? n <= m.T : single_chunk_;
     // the first chunk may be shorter (head_chunk_); the rest are m.T long
-    const int64_t head = hand_in_ == nullptr && n > m.T ? std::min(head_chunk_, m.T) : 0;
+    const int64_t head = first_stage && n > m.T ? std::min(head_chunk_, m.T) : 0;
     auto chunk_len = [&m, n, head](int64_t at) { return std::min(at == 0 && head > 0 ? head : m.T, n - at); };
     const cudaStream_t cs = (cudaStream_t) m.cs;
     // the MMQ row table lives in the borrowed cache slots, which the refill after a prompt overwrites with experts:
@@ -1520,7 +1582,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         }
         // the whole chunk's rows in one gather (the same per-element arithmetic as the per-token path, so the
         // same bits); a chunk with picture rows, or a token outside the table, takes the per-token path
-        bool batched = hand_in_ == nullptr && m.tok_dev != nullptr;
+        bool batched = first_stage && m.tok_dev != nullptr;
         const core::NativeEmbed* nemb = core::native_embed();
         const core::WeightRef* wemb = nemb ? nullptr : m.wt->find("token_embd.weight");
         if (batched && nemb == nullptr &&
@@ -1551,7 +1613,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                       (uint64_t) (wemb->ne0 / wemb->group_elems), m.emb, m.cs);
             }
         }
-        for (int64_t t = 0; hand_in_ == nullptr && !batched && t < T; ++t) {
+        for (int64_t t = 0; first_stage && !batched && t < T; ++t) {
             const float* row = embd_rows ? embd_rows[p0 + t] : nullptr;
             if (row) {
                 if (cudaMemcpyAsync(m.emb + t * N, row, (size_t) N * 4, cudaMemcpyHostToDevice, m.cs) != cudaSuccess) {
@@ -1562,7 +1624,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 return false;
             }
         }
-        if (hand_in_ == nullptr) gr_broadcast(m.emb, m.R, T, m.cs);
+        if (first_stage) gr_broadcast(m.emb, m.R, T, m.cs);
         // ---- the PLE rows of the whole chunk, one batched SSD request on a thread (see ple_gather).  A later chunk's
         // were read ahead during the previous chunk; the first chunk's are read beside layer 0 - they are needed from
         // layer 1 on, and gathering them here first would leave the GPU idle for the whole read
@@ -1635,36 +1697,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         // `used` event recorded), so the copy stream never waits on an event that is not queued yet
         const basalt::kernels::cpu::ExpertLayout& lay0 = basalt::kernels::cpu::expert_layout();
         const bool stream_all = m.ring > STAGE && T >= stream_all_min() && m.src != nullptr;
-        // the peer takes the rows of a chunk only up to its buffers' size; without direct access a streamed chunk only up
+        // the peer takes the rows of a chunk only up to its buffers' size; a streamed chunk only up
         // to T_fp4, and then on the FP4 kernels (PeerPrefill::T_fp4)
         PeerPrefill* const ppc =
-            m.pp && (T <= m.pp->T_max || (stream_all && T <= m.pp->T_fp4)) ? m.pp.get() : nullptr;
+            m.pp && m.peer_share && (T <= m.pp->T_max || (stream_all && T <= m.pp->T_fp4)) ? m.pp.get() : nullptr;
         const bool peer_fp4 = ppc && stream_all && ppc->T_fp4 > 0;
-        const bool ps_on = stream_all && ppc && ppc->ps_frac > 0.0;
-        if (ppc && !ps_on) ppc->ps_flag.clear();
-        // multi-GPU: the peer's ring - issue its copies up to `limit` / give entries back (the peer device is current)
-        auto p_issue_until = [&](size_t limit) {
-            PeerPrefill& P = *ppc;
-            limit = std::min(limit, P.pseq.size());
-            while (P.p_issued < limit) {
-                const PeerPrefill::PsEntry& en = P.pseq[P.p_issued];
-                const size_t sl = P.p_issued % (size_t) P.RP;
-                if (P.plive[sl]) cudaStreamWaitEvent(P.s_cp, P.pused[sl], 0);
-                cudaMemcpyAsync(P.pstage[sl], en.blob, (size_t) basalt::kernels::cpu::expert_layout().blob_bytes(en.l),
-                                cudaMemcpyHostToDevice, P.s_cp);
-                cudaEventRecord(P.pcopied[sl], P.s_cp);
-                P.plive[sl] = 1;
-                ++P.p_issued;
-            }
-        };
-        auto p_release_to = [&](int64_t l, int32_t e_stop, cudaStream_t ps) {
-            PeerPrefill& P = *ppc;
-            while (P.pk < P.pseq_start[(size_t) l + 1] && P.pseq[P.pk].e < e_stop) {
-                cudaEventRecord(P.pused[P.pk % (size_t) P.RP], ps);
-                ++P.pk;
-                p_issue_until(P.pk + (size_t) P.RP);
-            }
-        };
         struct StreamEntry { int32_t l, e; const uint8_t* blob; int job; const uint8_t* pdev; };
         std::vector<StreamEntry> seq;
         std::vector<size_t> seq_start;
@@ -1672,16 +1709,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         if (stream_all) {
             seq_start.assign((size_t) g.n_layers + 1, 0);
             std::vector<Stager::Job> js;
-            if (ps_on) {
-                ppc->pseq.clear();
-                ppc->pseq_start.assign((size_t) g.n_layers + 1, 0);
-                ppc->ps_flag.assign((size_t) g.n_layers * m.g->n_expert, 0);
-                ppc->p_issued = ppc->pk = 0;
-            }
-            double ps_acc = 0.0;
             for (int64_t l = LB; l < LE; ++l) {
                 seq_start[(size_t) l] = seq.size();
-                if (ps_on) ppc->pseq_start[(size_t) l] = ppc->pseq.size();
                 for (int32_t e = 0; e < m.g->n_expert; ++e) {
                     if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
                     if (ppc && ppc->peer && ppc->peer->has(l, e)) continue;   // multi-GPU: computed on (or read from) the peer
@@ -1691,18 +1720,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         seq.push_back({(int32_t) l, e, nullptr, -1, m.ring_peer->slot_ptr(l, e)});
                         continue;
                     }
+                    if (const uint8_t* rp = remote_blob(l, e)) {   // no pinned host copy: from the other card's cache
+                        seq.push_back({(int32_t) l, e, nullptr, -1, rp});
+                        continue;
+                    }
                     {
                         b = m.src->blob(l, e);
                         if (!b) { err = "prefill: expert source has no blob"; return false; }
-                        if (ps_on && m.src->pinned(l, e)) {   // multi-GPU: every ps_frac-th one goes to the peer's ring
-                            ps_acc += ppc->ps_frac;
-                            if (ps_acc >= 1.0) {
-                                ps_acc -= 1.0;
-                                ppc->pseq.push_back({(int32_t) l, e, b});
-                                ppc->ps_flag[(size_t) l * m.g->n_expert + e] = 1;
-                                continue;
-                            }
-                        }
                         if (!m.src->pinned(l, e)) {
                             job = (int) js.size();
                             js.push_back(make_job(*m.src, l, e, b, (size_t) lay0.blob_bytes(l)));
@@ -1713,7 +1737,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             }
             for (int64_t l = LE; l <= g.n_layers; ++l) {
                 seq_start[(size_t) l] = seq.size();
-                if (ps_on) ppc->pseq_start[(size_t) l] = ppc->pseq.size();
             }
             m.stager->start(std::move(js));
         }
@@ -1735,8 +1758,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             ~IssuerJoin() { if (t->joinable()) { stop->store(true); t->join(); } }
         } issuer_join{&a_stop, &issuer};
         const bool threaded_issue = stream_all;
-        const bool peer_async = m.ring_peer && !m.ring_peer->p2p() &&
-                                m.peer_stage.setup(m.ring_peer->device(), (size_t) MAXBLOB());
+        const bool peer_async = remote_device >= 0 && m.peer_stage.setup(remote_device, (size_t) MAXBLOB());
         if (threaded_issue) {
             issuer = std::thread([&] {
                 const core::OnDevice od(m.device);
@@ -1759,7 +1781,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
                     if (en.pdev != nullptr) {
                         if (peer_async) m.peer_stage.copy(m.stage_dev[sl], en.pdev, bytes, m.copy);
-                        else cudaMemcpyPeerAsync(m.stage_dev[sl], m.device, en.pdev, m.ring_peer->device(), bytes, m.copy);
+                        else cudaMemcpyPeerAsync(m.stage_dev[sl], m.device, en.pdev, remote_device, bytes, m.copy);
                         ++iss_dma;
                     } else if (en.job < 0) {
                         cudaMemcpyAsync(m.stage_dev[sl], en.blob, bytes, cudaMemcpyHostToDevice, m.copy);
@@ -1782,13 +1804,60 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             while (a_issued.load(std::memory_order_acquire) <= k) std::this_thread::yield();
         };
         auto give_back = [&](size_t upto) { a_consumed.store(upto, std::memory_order_release); };
-        if (ps_on) {
-            int pd = 0;
-            cudaGetDevice(&pd);
-            cudaSetDevice(ppc->dev);
-            p_issue_until((size_t) ppc->RP);
-            cudaSetDevice(pd);
-        }
+        // A chunk below stream_all_min(): each layer's MoE half also runs the next layer's router on its FFN rows, and the
+        // experts that guess gives more rows than the CPU share takes (most first; not resident, not the peer's) are
+        // copied ahead into the ring's slots past STAGE for that layer's parity, once this layer has every input of its
+        // combine (the CPU's and the peer's rows cross the same link): the link then works through this layer's end and
+        // the next one's attention half, when it would idle.  The next layer reads the ones its routing picked in place;
+        // what was copied ahead never changes what is computed or in which order.
+        const int ahead_n = !stream_all && m.host_res != nullptr && m.cache != nullptr && m.src != nullptr &&
+                                    m.guess_cap >= T * K
+                                ? (m.ring - STAGE) / 2 : 0;
+        int64_t guess_for = -1;   // the layer whose routing this layer's half guessed
+        m.ahead_layer[0] = m.ahead_layer[1] = m.guess_layer = -1;
+        auto copy_ahead = [&](int64_t L) {
+            if (ahead_n <= 0 || L >= LE || m.guess_layer != L) return;
+            // a layer whose K/V streams from the host uploads it on the compute stream: no copies ahead of it
+            if (core::is_qsa_layer(g, L)) {
+                int64_t qi = 0;
+                for (int64_t i = 0; i < L; ++i) qi += core::is_qsa_layer(g, i) ? 1 : 0;
+                if (ss.qsa_states[(size_t) qi].kv_mode == 1) return;
+            }
+            if (m.ahead_ev == nullptr && cudaEventCreateWithFlags(&m.ahead_ev, cudaEventDisableTiming) != cudaSuccess) {
+                m.ahead_ev = nullptr;
+                return;
+            }
+            std::vector<std::pair<int32_t, int32_t>> want;   // (-rows, expert)
+            for (int32_t e = 0; e < (int32_t) m.g->n_expert; ++e) {
+                const int32_t c = m.guess_rows[(size_t) e];
+                if (c <= basalt::kernels::cpu::MAXT || m.host_res[(size_t) L * m.g->n_expert + e] >= 0) continue;
+                if (ppc && ppc->peer && ppc->peer->has(L, e)) continue;
+                if (m.ring_peer && m.ring_peer->exclusive() && m.ring_peer->has(L, e)) continue;
+                if (!m.src->pinned(L, e)) continue;
+                want.emplace_back(-c, e);
+            }
+            std::sort(want.begin(), want.end());
+            const int b = (int) (L & 1);
+            std::vector<int32_t>& slot_of = m.ahead_slot[b];
+            std::fill(slot_of.begin(), slot_of.end(), -1);
+            m.ahead_layer[b] = L;
+            cudaEventRecord(m.ahead_ev, m.cs);
+            cudaStreamWaitEvent(m.copy, m.ahead_ev, 0);
+            int k = 0;
+            for (size_t i = 0; i < want.size() && k < ahead_n; ++i) {
+                const int32_t e = want[i].second;
+                const uint8_t* bl = m.src->blob(L, e);
+                if (bl == nullptr) continue;
+                const int sl = STAGE + b * ahead_n + k++;
+                if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
+                cudaMemcpyAsync(m.stage_dev[sl], bl, (size_t) lay0.blob_bytes(L), cudaMemcpyHostToDevice, m.copy);
+                cudaEventRecord(m.copied[sl], m.copy);
+                m.stage_live[sl] = true;
+                slot_of[(size_t) e] = sl;
+                ++stats_.experts_streamed;
+                ++stats_.experts_dma;
+            }
+        };
         bool normed = false;   // the previous half's write already normed R for this half (grs, xn16)
         for (int64_t l = LB; l < LE; ++l) {
             core::progress_beat();   // the serve watchdog: a prompt chunk of 8192 tokens is still moving
@@ -1796,6 +1865,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             core::progress_at("reading the prompt (batched): layer", l, p0);   // a stall names layer and chunk
             const core::LayerView v(*m.wt, l);
             if (l == std::max<int64_t>(LB, 1) && !ple_land()) return false;   // the PLE rows, read from layer 1 on
+            if (l == 1 && LB == 0 && ple_on) copy_ahead(1);
             // ---- the PLE block at layer 1, token by token (its conv reads the previous tokens' rows)
             if (l == 1 && ple_on && ple_batch) {
                 // the whole chunk at once, in sub-batches carved from the idle scratch region: the key and value
@@ -1993,6 +2063,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err)) return false;
                     route(m.logits, m.ids, m.w, T, m.g->n_expert, m.cs);
                     if (m.hist_on) route_count(m.ids, T * K, m.hist + l * m.g->n_expert, (int) m.g->n_expert, m.cs);
+                    if (ahead_n > 0 && l + 1 < LE) {   // the next layer's routing guessed (the logits are free again)
+                        const core::LayerView vn(*m.wt, l + 1);
+                        const core::WeightRef* wrn = vn.get("ffn_gate_inp.weight");
+                        std::string e2;
+                        if (wrn != nullptr && bf16_proj(m.gemm, wrn, m.mixed_bf, m.logits, T, vn.name("ffn_gate_inp.weight"), e2)) {
+                            route(m.logits, m.guess_ids, m.guess_w, T, m.g->n_expert, m.cs);
+                            copy_i32(m.guess_host_dev, m.guess_ids, T * K, m.cs);
+                            guess_for = l + 1;
+                        }
+                    }
                     // the shared expert and its scalar gate
                     if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
                     if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err)) return false;
@@ -2014,11 +2094,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // NVFP4 experts: FP4 block-scaled tensor cores, read in place from the blobs
                     const bool fp4_l = use_mmq && lay.native && mmq_gt == GGML_TYPE_NVFP4 && mmq_dt == GGML_TYPE_NVFP4 &&
                                        lay.fmt[(size_t) l].tail != 0 && T >= FP4_MIN_TOKENS;
-                    // a prompt peer: MMQ only, whether or not set_peer took it (it can decline), as fused_ring() sized
-                    // the ring and the buffers for it
-                    const bool no_peer = !core::prompt_peer();
-                    const bool fused_nat = use_mmq && stream_all && no_peer && lay.native && fused::native_supported(mmq_gt, mmq_dt);
-                    const bool fused_l = (use_mmq && stream_all && no_peer && !lay.native && fused::enabled()) || fused_nat;
+                    const bool fused_nat = use_mmq && stream_all && lay.native && fused::native_supported(mmq_gt, mmq_dt);
+                    const bool fused_l = (use_mmq && stream_all && !lay.native && fused::enabled()) || fused_nat;
                     bool peer_now = false;                // multi-GPU: the peer computed rows of this layer (MMQ path only)
                     // CPU share: this layer's CPU experts (rows [T * K - rows_cpu, T * K) of Dm) run on a thread that
                     // reads on_cpu, so the future (which waits for the thread) is declared after it
@@ -2124,6 +2201,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                           l, p0);
                         cudaStreamSynchronize(m.cs);
                         core::progress_at("reading the prompt (batched): layer", l, p0);
+                        if (guess_for == l + 1) {   // the guessed rows per expert of the next layer
+                            m.guess_rows.assign((size_t) m.g->n_expert, 0);
+                            for (int64_t i = 0; i < T * K; ++i) {
+                                const int32_t e = m.guess_host[(size_t) i];
+                                if (e >= 0 && e < (int32_t) m.g->n_expert) ++m.guess_rows[(size_t) e];
+                            }
+                            m.guess_layer = l + 1;
+                        }
                         std::fill(m.cnt.begin(), m.cnt.end(), 0);
                         for (int64_t i = 0; i < T * K; ++i) {
                             const int32_t e = ids_h[(size_t) i];
@@ -2138,11 +2223,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             on_peer.assign((size_t) m.g->n_expert, 0);
                             for (int32_t e = 0; e < m.g->n_expert; ++e) {
                                 const int32_t c = m.cnt[(size_t) e];
-                                if (c > 0 && !ppc->ps_flag.empty() && ppc->ps_flag[(size_t) l * m.g->n_expert + e]) {   // peer-streamed
-                                    on_peer[(size_t) e] = 2;
-                                    rows_peer += c;
-                                    continue;
-                                }
                                 if (c == 0 || (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) ||
                                     !ppc->peer || !ppc->peer->has(l, e))
                                     continue;
@@ -2187,10 +2267,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     m.off[(size_t) e] = r;
                                     r += m.cnt[(size_t) e];
                                 }
-                            // the peer's rows in order_peer's order (peer-held, then peer-streamed): its groups need them contiguous
-                            for (int kind = 1; kind <= 2 && !on_peer.empty(); ++kind)
-                                for (int32_t e = 0; e < m.g->n_expert; ++e)
-                                    if (on_peer[(size_t) e] == kind) { m.off[(size_t) e] = r; r += m.cnt[(size_t) e]; }
+                            // the peer's rows in order_peer's order: its groups need them contiguous
+                            for (int32_t e = 0; e < m.g->n_expert && !on_peer.empty(); ++e)
+                                if (on_peer[(size_t) e]) { m.off[(size_t) e] = r; r += m.cnt[(size_t) e]; }
                             for (int32_t e = 0; e < m.g->n_expert && !on_cpu.empty(); ++e)   // the CPU's block, last
                                 if (on_cpu[(size_t) e]) { m.off[(size_t) e] = r; r += m.cnt[(size_t) e]; }
                             m.off[(size_t) m.g->n_expert] = r;
@@ -2212,11 +2291,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // the experts, in id order: resident ones from VRAM, the others through the staging ring
                         std::vector<int32_t> order, order_peer;
                         for (int32_t e = 0; e < m.g->n_expert; ++e)
-                            if (m.cnt[(size_t) e] > 0 && (on_peer.empty() || on_peer[(size_t) e] != 2) &&
-                                (on_cpu.empty() || !on_cpu[(size_t) e]))
+                            if (m.cnt[(size_t) e] > 0 && (on_cpu.empty() || !on_cpu[(size_t) e]))
                                 (!on_peer.empty() && on_peer[(size_t) e] ? order_peer : order).push_back(e);
-                        for (int32_t e = 0; e < m.g->n_expert && !on_peer.empty(); ++e)   // the peer-streamed ones last:
-                            if (on_peer[(size_t) e] == 2) order_peer.push_back(e);        // their copies get the most time
                         // CPU share: the pool runs the CPU's experts while this thread stages and runs the GPU's; their
                         // unweighted rows land in Dm's row order, so the combine weights them like any other row
                         if (rows_cpu > 0) {
@@ -2303,7 +2379,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // multi-GPU: the peer's share, enqueued before the primary's own experts so both cards work at once
                         peer_now = use_mmq && !order_peer.empty();
                         if (peer_now && peer_fp4) {
-                            // without direct access, a streamed chunk: the FP4 kernels in pieces (PeerPrefill::T_fp4)
+                            // a streamed chunk: the FP4 kernels in pieces (PeerPrefill::T_fp4)
                             PeerPrefill& P = *ppc;
                             if (!fp4_l) {
                                 err = "prefill: the peer's share of a streamed chunk needs the FP4 experts";
@@ -2427,21 +2503,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     for (size_t j = j0; j < j1; ++j) {
                                         const int32_t e = order_peer[j];
                                         maxr = std::max<int64_t>(maxr, m.cnt[(size_t) e]);
-                                        const uint8_t* bd = nullptr;
-                                        int psl = -1;
-                                        if (on_peer[(size_t) e] == 2) {   // from the peer's ring
-                                            p_release_to(l, e, ps);
-                                            if (P.pk >= P.pseq_start[(size_t) l + 1] || P.pseq[P.pk].e != e) {
-                                                err = "prefill: a peer-streamed expert is not next in the peer's ring";
-                                                cudaSetDevice(prevd);
-                                                return false;
-                                            }
-                                            psl = (int) (P.pk % (size_t) P.RP);
-                                            cudaStreamWaitEvent(ps, P.pcopied[(size_t) psl], 0);
-                                            bd = P.pstage[(size_t) psl];
-                                        } else {
-                                            bd = P.peer->slot_ptr(l, e);
-                                        }
+                                        const uint8_t* bd = P.peer->slot_ptr(l, e);
                                         const size_t q = j - j0;
                                         if (lay.native)
                                             mmq::gather_native(bd, bd + f.up_off, mmq_gub / 2, bd + f.down_off, mmq_db,
@@ -2450,11 +2512,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                                grp_scales(P.grp_d) + 4 * q);
                                         else
                                             mmq::gather_q2(bd, P.grp_gu + q * mmq_gub, P.grp_d + q * mmq_db, ps);
-                                        if (psl >= 0) {   // the slot is free once gathered
-                                            cudaEventRecord(P.pused[(size_t) psl], ps);
-                                            ++P.pk;
-                                            p_issue_until(P.pk + (size_t) P.RP);
-                                        }
                                     }
                                     const int64_t r0 = P.bounds_host[j0], nr = P.bounds_host[j1] - r0;
                                     if (nr <= 0) continue;
@@ -2490,20 +2547,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             P.out_pending = true;
                             cudaSetDevice(prevd);
                         }
-                        if (ps_on) {   // multi-GPU: this layer's peer-ring entries the routing did not pick give their slots back
-                            int pd = 0;
-                            cudaGetDevice(&pd);
-                            cudaSetDevice(ppc->dev);
-                            p_release_to(l, (int32_t) m.g->n_expert, ppc->s);
-                            cudaSetDevice(pd);
-                        }
                         // --peer-exclusive: an expert only the peer holds has no host copy.  It is copied from the peer's
-                        // memory into a staging slot, or (with direct access between the cards) read in place.
-                        auto peer_ring = [&](int32_t e) {
-                            return m.ring_peer && m.ring_peer->exclusive() && m.ring_peer->has(l, e) &&
-                                   !(m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0);
+                        // memory into a staging slot; so is one set_ring_remote's card holds without a pinned host copy.
+                        // The blob on the other card, or null.
+                        auto other_card = [&](int32_t e) -> const uint8_t* {
+                            if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) return nullptr;
+                            if (m.ring_peer && m.ring_peer->exclusive() && m.ring_peer->has(l, e))
+                                return m.ring_peer->slot_ptr(l, e);
+                            return remote_blob(l, e);
                         };
-                        auto peer_direct = [&](int32_t e) { return peer_ring(e) && m.ring_peer->p2p(); };
                         // Stage ahead: the copy stream moves blobs host -> device while the compute stream works.
                         int stage_next = 0;
                         std::vector<int> stage_of(order.size(), -1);
@@ -2514,7 +2566,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             for (size_t j = 0; j < order.size(); ++j) {
                                 const int32_t e = order[j];
                                 if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
-                                if (peer_ring(e)) continue;
+                                if (other_card(e) != nullptr) continue;
                                 if (m.src->pinned(l, e)) continue;
                                 job_of[j] = (int) js.size();
                                 const uint8_t* b = m.src->blob(l, e);
@@ -2527,20 +2579,23 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         auto stage_one = [&](size_t j) -> bool {
                             const int32_t e = order[j];
                             const bool resident = m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
-                            if (resident || peer_direct(e)) return true;
+                            if (resident) return true;
+                            if (ahead_n > 0 && m.ahead_layer[l & 1] == l && m.ahead_slot[l & 1][(size_t) e] >= 0) {
+                                stage_of[j] = m.ahead_slot[l & 1][(size_t) e];   // copied ahead of the routing
+                                return true;
+                            }
                             const int sl = stage_next;
                             stage_next = (stage_next + 1) % STAGE;
                             const auto th = Clock::now();
-                            const bool via_peer = peer_ring(e);
-                            const bool pinned = !via_peer && m.src->pinned(l, e);
+                            const uint8_t* via = other_card(e);
+                            const bool pinned = via == nullptr && m.src->pinned(l, e);
                             const uint8_t* b = pinned ? m.src->blob(l, e) : nullptr;
                             if (pinned && !b) { err = "prefill: expert source has no blob"; return false; }
-                            if (via_peer) {
+                            if (via != nullptr) {
                                 if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
-                                if (peer_async) m.peer_stage.copy(m.stage_dev[sl], m.ring_peer->slot_ptr(l, e),
-                                                                  (size_t) lay.blob_bytes(l), m.copy);
-                                else cudaMemcpyPeerAsync(m.stage_dev[sl], m.device, m.ring_peer->slot_ptr(l, e),
-                                                         m.ring_peer->device(), (size_t) lay.blob_bytes(l), m.copy);
+                                if (peer_async) m.peer_stage.copy(m.stage_dev[sl], via, (size_t) lay.blob_bytes(l), m.copy);
+                                else cudaMemcpyPeerAsync(m.stage_dev[sl], m.device, via, remote_device,
+                                                         (size_t) lay.blob_bytes(l), m.copy);
                                 ++stats_.experts_dma;
                             } else if (pinned) {
                                 // DMA straight from the page-locked arena: the copy stream only waits for the slot
@@ -2633,9 +2688,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 if (fp4_n == 0) fp4_j0 = j;
                                 fp4_blob[fp4_n++] = blob_dev;
                                 if (slot >= 0) gg_slots[gg_nslots++] = slot;
-                                // a group at the walk's end of MMQ_GROUP experts; outside the streamed walk the staging
-                                // ring reuses a slot as soon as the next expert starts, so one expert at a time
-                                if (group_gather && j % MMQ_GROUP != MMQ_GROUP - 1 && j + 1 < order.size()) return true;
+                                // groups of MMQ_GROUP experts: the streamed walk's, and the staged walk's, whose ring
+                                // holds two groups (each copy is waited for before its expert joins the group)
+                                if ((group_gather || !stream_all) && j % MMQ_GROUP != MMQ_GROUP - 1 && j + 1 < order.size())
+                                    return true;
                                 fp4_flush();
                                 return true;
                             }
@@ -2710,7 +2766,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         if (cpu_maybe) cudaEventRecord(m.cpu_gev[0], m.cs);
                         if (!stream_all) {
                             size_t staged = 0;
-                            const size_t lookahead = STAGE - 1;
+                            // staged this far ahead, a slot is copied into again only after the group that read it
+                            const size_t lookahead = STAGE - MMQ_GROUP - 1;
                             for (size_t j = 0; j < order.size(); ++j) {
                                 while (staged < order.size() && staged <= j + lookahead) {
                                     if (!stage_one(staged)) return false;
@@ -2757,7 +2814,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 } else {
                                     const bool r0 = m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
                                     const uint8_t* bp = r0 ? m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e])
-                                                           : (ppc && ppc->peer ? ppc->peer->slot_ptr(l, e) : nullptr);   // over the cap: P2P
+                                                           : nullptr;
                                     if (bp == nullptr) { err = "prefill: an expert is neither resident, streamed nor on the peer"; return false; }
                                     ++stats_.experts_resident;
                                     if (!compute(j, bp, -1)) return false;
@@ -2775,9 +2832,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         stats_.experts_cpu += n_cpu;
                         stats_.cpu_share = m.cpu_share_now;
                     }
-                    if (peer_now) {   // multi-GPU: the peer's rows are in Dm (or, without P2P, in host memory)
+                    if (peer_now) {   // multi-GPU: the peer's rows are in Dm (or in host memory)
                         cudaStreamWaitEvent(m.cs, peer_fp4 ? ppc->ev_res : ppc->ev_done, 0);
                     }
+                    if (!(l == 0 && ple_on)) copy_ahead(l + 1);   // layer 1's upload of its PLE rows goes first
                     moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
                 }
                 // ---- the hyper-connection write of this half; fused with the next half's norm when nothing else
@@ -2811,7 +2869,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         }
         stats_.tokens += T;
         core::progress_at("reading the prompt (batched): finishing the chunk from token", p0);
+        if (next_ != nullptr && keep_last_ && c0 + T >= n) continue;   // kept: its later layers run on this card next
+        if (next_ != nullptr && keep_last_ && keep_here && keep_here(p0 + T)) break;   // kept, and the run ends with it
         if (next_ != nullptr) {
+            if (T > m.hand_rows || m.hand[hand_buf_] == nullptr) {
+                err = "prefill: the layer split's hand-off buffers are too small for the chunk";
+                return false;
+            }
             // The current hand-off slot was used two chunks ago.
             float* h = m.hand[hand_buf_];
             if (cudaMemcpyAsync(h, m.R, (size_t) T * D * 4, cudaMemcpyDeviceToHost, m.cs) != cudaSuccess ||
@@ -2855,6 +2919,24 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         return false;
     }
     stats_.ms_total += ms_since(t_start);
+    return true;
+}
+
+bool Prefill::reserve_hand_off(int64_t rows, std::string& err) {
+    Impl& m = *impl_;
+    if (m.hand[0] != nullptr && m.hand[1] != nullptr && m.hand_rows >= rows) return true;
+    for (int b = 0; b < 2; ++b) {
+        if (m.hand[b] != nullptr) cudaFreeHost(m.hand[b]);
+        m.hand[b] = nullptr;
+    }
+    m.hand_rows = 0;
+    for (int b = 0; b < 2; ++b)
+        if (cudaHostAlloc((void**) &m.hand[b], (size_t) rows * D * 4, cudaHostAllocPortable) != cudaSuccess) {
+            (void) cudaGetLastError();
+            err = "prefill: the layer split's hand-off buffers";
+            return false;
+        }
+    m.hand_rows = rows;
     return true;
 }
 
